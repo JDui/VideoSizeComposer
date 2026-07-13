@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use filetime::{set_file_mtime, FileTime};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -94,6 +95,8 @@ struct QueueItem {
     bitrate: u64,
     duration: f64,
     size_bytes: u64,
+    #[serde(default, skip_deserializing)]
+    thumbnail: String,
     is_panorama: bool,
     #[serde(default)]
     panorama_tagged: bool,
@@ -745,6 +748,7 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         bitrate: bit_rate,
         duration,
         size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
+        thumbnail: generate_thumbnail(path, duration),
         is_panorama: detect_panorama(&json),
         panorama_tagged: detect_panorama_tagged(&json),
         bit_depth: detect_bit_depth(&video, pixel_format),
@@ -767,6 +771,43 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         status: "等待中".into(),
         progress: 0,
     })
+}
+
+fn generate_thumbnail(path: &Path, duration: f64) -> String {
+    let seek_seconds = if duration > 0.0 {
+        (duration * 0.1).clamp(0.1, 3.0)
+    } else {
+        0.1
+    };
+    let seek = format!("{seek_seconds:.3}");
+    let output = command_with_hidden_window(resolve_tool("ffmpeg"))
+        .args([
+            "-v",
+            "error",
+            "-ss",
+            seek.as_str(),
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=280:-2",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+            format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(output.stdout))
+        }
+        _ => String::new(),
+    }
 }
 
 fn encode_job(
@@ -1011,6 +1052,9 @@ fn build_ffmpeg_args(item: &QueueItem, preset: &Preset, output: &Path) -> Vec<St
     let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
+        "-progress".into(),
+        "pipe:2".into(),
+        "-nostats".into(),
         "-i".into(),
         item.source.clone(),
         "-map".into(),
@@ -1788,6 +1832,7 @@ mod tests {
         assert_eq!(item.width, 320);
         assert_eq!(item.height, 180);
         assert!(item.duration > 0.0);
+        assert!(item.thumbnail.starts_with("data:image/jpeg;base64,"));
 
         for codec in ["h264", "h265"] {
             let mut preset = default_presets()
@@ -1829,6 +1874,7 @@ mod tests {
             bitrate: 40_000_000,
             duration: 10.0,
             size_bytes: 10,
+            thumbnail: String::new(),
             is_panorama: true,
             panorama_tagged: true,
             bit_depth: 8,
@@ -1851,6 +1897,7 @@ mod tests {
         av1.bit_depth = "10".into();
         av1.chroma = "420".into();
         let av1_args = build_ffmpeg_args(&item, &av1, Path::new("out.mp4")).join(" ");
+        assert!(av1_args.contains("-progress pipe:2 -nostats"));
         assert!(av1_args.contains("libaom-av1") || av1_args.contains("av1_nvenc"));
         assert!(av1_args.contains("-vf"));
         assert!(av1_args.contains("scale="));
@@ -2049,6 +2096,7 @@ mod tests {
             bitrate: 10_000_000,
             duration: 10.0,
             size_bytes: 10,
+            thumbnail: String::new(),
             is_panorama: true,
             panorama_tagged: false,
             bit_depth: 8,
@@ -2191,6 +2239,7 @@ mod tests {
             bitrate: 1_000_000,
             duration: 1.0,
             size_bytes: 1024,
+            thumbnail: String::new(),
             is_panorama: false,
             panorama_tagged: false,
             bit_depth: 8,

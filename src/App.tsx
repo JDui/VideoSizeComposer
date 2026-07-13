@@ -14,7 +14,6 @@ import {
   FolderOpen,
   Gauge,
   HelpCircle,
-  Monitor,
   PanelLeftClose,
   PanelLeftOpen,
   Play,
@@ -23,19 +22,11 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
-  Smartphone,
   Square,
   Trash2,
-  Tv,
   X,
   Zap
 } from "lucide-react";
-import mountainsThumb from "./assets/thumbs/mountains.jpg";
-import waterfallThumb from "./assets/thumbs/waterfall.jpg";
-import cityThumb from "./assets/thumbs/city-night.jpg";
-import interviewThumb from "./assets/thumbs/interview.jpg";
-import productThumb from "./assets/thumbs/product-demo.jpg";
-import stageThumb from "./assets/thumbs/stage.jpg";
 import {
   cancelEncode,
   defaultPreferences,
@@ -59,7 +50,6 @@ import {
 } from "./tauri";
 import type { AppPreferences, Codec, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
 
-const thumbnails = [mountainsThumb, waterfallThumb, cityThumb, interviewThumb, productThumb, stageThumb];
 const defaultPlatform: PlatformInfo = { os: "unknown", accelerators: ["auto", "cpu"] };
 const defaultToolStatus: ToolStatus = { ffmpeg: "检测中", ffprobe: "检测中", encoders: [], ok: false };
 
@@ -102,10 +92,27 @@ export default function App() {
   const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(loadPreferences);
   const [encodingIds, setEncodingIds] = useState<string[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
+  const [activeJobIds, setActiveJobIds] = useState<string[]>([]);
+  const [encodeStartedAt, setEncodeStartedAt] = useState<number | null>(null);
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [marquee, setMarquee] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const [lastError, setLastError] = useState("");
   const [notice, setNotice] = useState("");
   const [log, setLog] = useState<string[]>(["FFmpeg 环境检测中…", "等待添加媒体"]);
   const simulationTimer = useRef<number | null>(null);
+  const queueBodyRef = useRef<HTMLDivElement>(null);
+  const selectionAnchorId = useRef("");
+  const suppressRowClick = useRef(false);
+  const marqueeStart = useRef<{
+    x: number;
+    y: number;
+    clientX: number;
+    clientY: number;
+    pointerId: number;
+    additive: boolean;
+    initialSelected: Set<string>;
+    dragging: boolean;
+  } | null>(null);
 
   const activePreset = outputPreset;
   const selectedItems = useMemo(() => queue.filter((item) => item.selected), [queue]);
@@ -120,9 +127,18 @@ export default function App() {
     0
   );
   const savings = totalSourceSize > 0 ? Math.max(0, Math.round((1 - totalEstimatedSize / totalSourceSize) * 100)) : 0;
-  const estimatedTimeLabel = "待首次校准";
   const completedCount = queue.filter((item) => item.status.includes("完成")).length;
   const failedCount = queue.filter((item) => item.status.includes("失败")).length;
+  const activeDuration = activeJobIds.reduce((sum, id) => sum + (queue.find((item) => item.id === id)?.duration ?? 0), 0);
+  const overallProgress = activeDuration > 0
+    ? Math.round(activeJobIds.reduce((sum, id) => {
+        const item = queue.find((entry) => entry.id === id);
+        return sum + (item?.duration ?? 0) * (item?.progress ?? 0);
+      }, 0) / activeDuration)
+    : 0;
+  const remainingTimeLabel = isEncoding && encodeStartedAt
+    ? estimateRemainingTime(overallProgress, clockNow - encodeStartedAt)
+    : "";
 
   useEffect(() => {
     getPlatformInfo().then(setPlatform);
@@ -192,6 +208,12 @@ export default function App() {
 
   useEffect(() => {
     if (!isEncoding) setActiveSessionId("");
+  }, [isEncoding]);
+
+  useEffect(() => {
+    if (!isEncoding) return;
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
   }, [isEncoding]);
 
   useEffect(() => () => {
@@ -352,6 +374,9 @@ export default function App() {
     if (preferences.autoOpenDetails) setDetailsOpen(true);
     setLastError("");
     setEncodingIds(jobs.map((job) => job.item.id));
+    setActiveJobIds(jobs.map((job) => job.item.id));
+    setEncodeStartedAt(Date.now());
+    setClockNow(Date.now());
     setQueue((items) =>
       items.map((item) => (item.selected ? { ...item, status: "排队中", progress: 0 } : item))
     );
@@ -364,6 +389,8 @@ export default function App() {
       const message = error instanceof Error ? error.message : String(error);
       setLastError(message);
       setEncodingIds([]);
+      setActiveJobIds([]);
+      setEncodeStartedAt(null);
       setQueue((items) => items.map((item) => (item.selected ? { ...item, status: "失败" } : item)));
     }
   }
@@ -411,6 +438,101 @@ export default function App() {
     } catch (error) {
       setLastError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function updateItemSelection(itemId: string, selected: boolean, shiftKey: boolean) {
+    const visibleIds = visibleItems.map((item) => item.id);
+    const anchorIndex = visibleIds.indexOf(selectionAnchorId.current);
+    const itemIndex = visibleIds.indexOf(itemId);
+    if (shiftKey && anchorIndex >= 0 && itemIndex >= 0) {
+      const first = Math.min(anchorIndex, itemIndex);
+      const last = Math.max(anchorIndex, itemIndex);
+      const range = new Set(visibleIds.slice(first, last + 1));
+      setQueue((items) => items.map((item) => range.has(item.id) ? { ...item, selected } : item));
+    } else {
+      setQueue((items) => items.map((item) => item.id === itemId ? { ...item, selected } : item));
+    }
+    selectionAnchorId.current = itemId;
+  }
+
+  function handleRowClick(event: React.MouseEvent<HTMLElement>, itemId: string) {
+    if (suppressRowClick.current) return;
+    if ((event.target as HTMLElement).closest("button, input, label, a")) return;
+    if (event.shiftKey) {
+      updateItemSelection(itemId, true, true);
+    } else if (event.ctrlKey || event.metaKey) {
+      const item = queue.find((entry) => entry.id === itemId);
+      updateItemSelection(itemId, !(item?.selected ?? false), false);
+    } else {
+      setQueue((items) => items.map((item) => ({ ...item, selected: item.id === itemId })));
+      selectionAnchorId.current = itemId;
+    }
+  }
+
+  function beginMarquee(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button, input, label, a")) return;
+    const body = queueBodyRef.current;
+    if (!body) return;
+    const bounds = body.getBoundingClientRect();
+    marqueeStart.current = {
+      x: event.clientX - bounds.left + body.scrollLeft,
+      y: event.clientY - bounds.top + body.scrollTop,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      pointerId: event.pointerId,
+      additive: event.ctrlKey || event.metaKey,
+      initialSelected: new Set(queue.filter((item) => item.selected).map((item) => item.id)),
+      dragging: false
+    };
+    body.setPointerCapture(event.pointerId);
+  }
+
+  function moveMarquee(event: React.PointerEvent<HTMLDivElement>) {
+    const start = marqueeStart.current;
+    const body = queueBodyRef.current;
+    if (!start || !body || start.pointerId !== event.pointerId) return;
+    if (!start.dragging && Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) < 5) return;
+    start.dragging = true;
+    event.preventDefault();
+    const bounds = body.getBoundingClientRect();
+    const currentX = event.clientX - bounds.left + body.scrollLeft;
+    const currentY = event.clientY - bounds.top + body.scrollTop;
+    const clientRect = {
+      left: Math.min(start.clientX, event.clientX),
+      right: Math.max(start.clientX, event.clientX),
+      top: Math.min(start.clientY, event.clientY),
+      bottom: Math.max(start.clientY, event.clientY)
+    };
+    const hitIds = new Set(
+      Array.from(body.querySelectorAll<HTMLElement>("[data-item-id]"))
+        .filter((row) => intersects(clientRect, row.getBoundingClientRect()))
+        .map((row) => row.dataset.itemId!)
+    );
+    const visibleIds = new Set(visibleItems.map((item) => item.id));
+    setQueue((items) => items.map((item) => {
+      if (!visibleIds.has(item.id)) return item;
+      const selected = hitIds.has(item.id) || (start.additive && start.initialSelected.has(item.id));
+      return item.selected === selected ? item : { ...item, selected };
+    }));
+    setMarquee({
+      left: Math.min(start.x, currentX),
+      top: Math.min(start.y, currentY),
+      width: Math.abs(currentX - start.x),
+      height: Math.abs(currentY - start.y)
+    });
+  }
+
+  function endMarquee(event: React.PointerEvent<HTMLDivElement>) {
+    const start = marqueeStart.current;
+    const body = queueBodyRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    if (body?.hasPointerCapture(event.pointerId)) body.releasePointerCapture(event.pointerId);
+    if (start.dragging) {
+      suppressRowClick.current = true;
+      window.setTimeout(() => { suppressRowClick.current = false; }, 0);
+    }
+    marqueeStart.current = null;
+    setMarquee(null);
   }
 
   const hardwareSummary = hardwareLabel(activePreset?.hardware ?? "auto", platform);
@@ -474,15 +596,13 @@ export default function App() {
         <section className="main-workbench">
           <StageStepper step={step} onStep={setStep} />
 
-          <section className="forecast-panel" aria-label="压缩结果预测">
+          <section className={`forecast-panel ${isEncoding ? "is-encoding" : ""}`} aria-label="压缩结果预测">
             <div className="forecast-size">
               <span className="eyebrow">预计效果 · 选中 {selectedItems.length} 个文件</span>
               <div><strong>{formatBytes(totalSourceSize)}</strong><span className="forecast-arrow">→</span><strong className="accent">{formatBytes(totalEstimatedSize)}</strong></div>
               <small>预计减少 {savings}% · 根据当前预设估算</small>
             </div>
-            <div className="forecast-metric"><Clock3 size={18} /><span><strong>{estimatedTimeLabel}</strong><small>设备实测后估算</small></span></div>
-            <div className="forecast-metric"><ShieldCheck size={18} className="success-icon" /><span><strong>{toolStatus.ok ? "良好" : "需处理"}</strong><small>兼容性预估</small></span></div>
-            <div className="compatibility-icons" aria-label="兼容设备"><Monitor size={18} /><Smartphone size={18} /><Tv size={18} /></div>
+            {isEncoding && <div className="forecast-metric encode-forecast"><Clock3 size={18} /><span><strong>{remainingTimeLabel}</strong><small>根据当前编码速度估算</small></span></div>}
             <button className="output-location" onClick={chooseOutputFolder}>
               <span><small>输出位置</small><strong>{shortPath(outputDirectory(activePreset))}</strong></span><FolderOpen size={18} />
             </button>
@@ -501,18 +621,31 @@ export default function App() {
             </header>
 
             <div className="queue-head" aria-hidden="true"><span /><span>文件名</span><span>源文件信息</span><span>预计输出</span><span>状态</span><span /></div>
-            <div className="queue-body">
+            <div
+              className={`queue-body ${marquee ? "is-marquee-selecting" : ""}`}
+              ref={queueBodyRef}
+              onPointerDown={beginMarquee}
+              onPointerMove={moveMarquee}
+              onPointerUp={endMarquee}
+              onPointerCancel={endMarquee}
+            >
+              {marquee && <span className="selection-marquee" style={marquee} aria-hidden="true" />}
               {visibleItems.length ? visibleItems.map((item, index) => {
                 const itemPreset = presetForItem(item, presets, activePreset);
                 const predicted = estimateOutputBytes(item, itemPreset);
                 return (
-                  <article className={`media-row ${item.selected ? "is-selected" : ""}`} key={item.id}>
-                    <label className="row-check"><input type="checkbox" checked={item.selected} onChange={(event) => setQueue((items) => items.map((entry) => entry.id === item.id ? { ...entry, selected: event.target.checked } : entry))} /><span><Check size={12} /></span><em>{index + 1}</em></label>
-                    <div className="media-identity"><img src={thumbnails[index % thumbnails.length]} alt="" /><span><strong>{item.fileName}</strong><small>{formatDuration(item.duration)}</small></span></div>
+                  <article
+                    className={`media-row ${item.selected ? "is-selected" : ""}`}
+                    key={item.id}
+                    data-item-id={item.id}
+                    onClick={(event) => handleRowClick(event, item.id)}
+                  >
+                    <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
+                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 视频缩略图`} draggable={false} /> : <span className="video-thumb-fallback"><Film size={19} /></span>}<span><strong>{item.fileName}</strong><small>{formatDuration(item.duration)}</small></span></div>
                     <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.isPanorama && <em>{item.panoramaTagged ? "360° 已识别" : "360° 画幅候选"}</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}</span></div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
                     <StatusCell item={item} />
-                    <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={() => { setDetailItemId(item.id); setDetailsOpen(true); }}><ChevronRight size={19} /></button>
+                    <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); setDetailItemId(item.id); setDetailsOpen(true); }}><ChevronRight size={19} /></button>
                   </article>
                 );
               }) : (
@@ -520,7 +653,7 @@ export default function App() {
               )}
             </div>
             <footer className="queue-footer">
-              <label className="select-all"><input type="checkbox" checked={queue.length > 0 && selectedItems.length === queue.length} onChange={(event) => setQueue((items) => items.map((item) => ({ ...item, selected: event.target.checked })))} />已选择 {selectedItems.length} / {queue.length} 个文件</label>
+              <label className="select-all" title="支持 Shift 连选、Ctrl/Cmd 多选和拖拽框选"><input type="checkbox" checked={queue.length > 0 && selectedItems.length === queue.length} onChange={(event) => setQueue((items) => items.map((item) => ({ ...item, selected: event.target.checked })))} />已选择 {selectedItems.length} / {queue.length} 个文件</label>
               <div><span>总大小：{formatBytes(totalSourceSize)}</span><strong>预计输出：{formatBytes(totalEstimatedSize)} (-{savings}%)</strong></div>
             </footer>
           </section>
@@ -597,7 +730,11 @@ export default function App() {
 
       <footer className="action-bar">
         <div className="action-summary">
-          <span>{selectedItems.length} 个文件</span><span>{formatBytes(totalSourceSize)} → <strong>{formatBytes(totalEstimatedSize)}</strong></span><span>{estimatedTimeLabel}</span><span className="hardware-pill"><Zap size={14} />{hardwareSummary}</span>
+          {isEncoding ? <div className="overall-progress" aria-label={`总进度 ${overallProgress}%`}>
+            <span><strong>总进度 {overallProgress}%</strong><small>预计剩余 {remainingTimeLabel}</small></span>
+            <span className="overall-progress-track"><span style={{ width: `${overallProgress}%` }} /></span>
+          </div> : <><span>{selectedItems.length} 个文件</span><span>{formatBytes(totalSourceSize)} → <strong>{formatBytes(totalEstimatedSize)}</strong></span></>}
+          <span className="hardware-pill"><Zap size={14} />{hardwareSummary}</span>
         </div>
         {isEncoding
           ? <button className="cancel-button" onClick={cancelCurrentEncoding}><Square size={15} />取消任务</button>
@@ -635,7 +772,7 @@ export default function App() {
           <div><span>1</span><p><strong>添加媒体</strong><small>可选择视频、导入文件夹，或把文件直接拖入队列。</small></p></div>
           <div><span>2</span><p><strong>设置当前任务</strong><small>右侧参数只影响当前选中文件；需要长期复用时，再“另存为预设”。</small></p></div>
           <div><span>3</span><p><strong>管理我的预设</strong><small>左侧预设可应用、独立编辑和删除，整个抽屉也可以折叠。</small></p></div>
-          <div><span>4</span><p><strong>开始压缩</strong><small>启动前会检查目录、空间和参数兼容性，输出重名时自动编号。</small></p></div>
+          <div><span>4</span><p><strong>开始压缩</strong><small>任务启动时检查输出目录与可用空间，输出重名时自动编号。</small></p></div>
         </div>
         <div className="help-note"><ShieldCheck size={17} /><span>选择“原视频参数”时，会针对队列中的每个视频分别继承其色深和色度采样。</span></div>
       </Modal>}
@@ -713,9 +850,24 @@ function StatusCell({ item }: { item: QueueItem }) {
   const active = item.status.includes("编码") || item.status.includes("排队");
   const timePreserved = item.status.includes("原始时间");
   return <div className={`status-cell ${failed ? "failed" : complete ? "complete" : cancelled ? "cancelled" : active ? "active" : "ready"}`}>
-    <strong>{failed ? "失败" : complete ? "已完成" : cancelled ? "已取消" : active ? item.status : "就绪"}</strong>
+    <strong>{failed ? "失败" : complete ? "已完成" : cancelled ? "已取消" : active ? item.progress > 0 && !item.status.includes("%") ? `${item.status} ${item.progress}%` : item.status : "就绪"}</strong>
     {complete ? <small>{timePreserved ? "创建与修改时间已保留" : "输出已生成"}</small> : cancelled ? <small>未生成输出文件</small> : active ? <span className="row-progress"><span style={{ width: `${item.progress}%` }} /></span> : <small>等待开始</small>}
   </div>;
+}
+
+function estimateRemainingTime(progress: number, elapsedMs: number) {
+  if (progress <= 0 || elapsedMs < 1000) return "计算中…";
+  const remainingSeconds = Math.max(0, Math.round((elapsedMs / 1000) * (100 - progress) / progress));
+  if (remainingSeconds < 60) return `约 ${Math.max(1, remainingSeconds)} 秒`;
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = remainingSeconds % 60;
+  if (minutes < 60) return `约 ${minutes} 分 ${seconds} 秒`;
+  const hours = Math.floor(minutes / 60);
+  return `约 ${hours} 小时 ${minutes % 60} 分`;
+}
+
+function intersects(a: { left: number; right: number; top: number; bottom: number }, b: { left: number; right: number; top: number; bottom: number }) {
+  return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
 }
 
 function presetForItem(item: QueueItem, presets: Preset[], fallback?: Preset) {

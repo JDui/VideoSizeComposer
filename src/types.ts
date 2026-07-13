@@ -58,6 +58,7 @@ export interface QueueItem {
   bitrate: number;
   duration: number;
   sizeBytes: number;
+  thumbnail?: string;
   isPanorama: boolean;
   panoramaTagged: boolean;
   bitDepth: number;

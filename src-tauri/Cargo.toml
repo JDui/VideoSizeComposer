@@ -1,6 +1,6 @@
 [package]
 name = "videosize-composer"
-version = "0.2.0"
+version = "0.1.0-alpha.1"
 description = "Cross-platform video compression tool"
 authors = ["VideoSize Composer"]
 edition = "2021"
@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22"
 dirs = "5"
 filetime = "0.2"
 fs2 = "0.4"
