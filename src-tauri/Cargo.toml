@@ -1,0 +1,30 @@
+[package]
+name = "videosize-composer"
+version = "0.2.0"
+description = "Cross-platform video compression tool"
+authors = ["VideoSize Composer"]
+edition = "2021"
+
+[lib]
+name = "videosize_composer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs = "5"
+filetime = "0.2"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(macos)'.dependencies]
+libc = "0.2"

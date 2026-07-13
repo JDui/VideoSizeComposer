@@ -1,0 +1,7 @@
+node_modules/
+dist/
+portable/
+src-tauri/target/
+.vite/
+*.log
+qa/native-e2e/*.mp4
