@@ -14,6 +14,7 @@ import {
   FolderOpen,
   Gauge,
   HelpCircle,
+  LoaderCircle,
   PanelLeftClose,
   PanelLeftOpen,
   Play,
@@ -91,6 +92,7 @@ export default function App() {
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
   const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(loadPreferences);
   const [encodingIds, setEncodingIds] = useState<string[]>([]);
+  const [isImporting, setIsImporting] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [activeJobIds, setActiveJobIds] = useState<string[]>([]);
   const [encodeStartedAt, setEncodeStartedAt] = useState<number | null>(null);
@@ -100,6 +102,7 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [log, setLog] = useState<string[]>(["FFmpeg 环境检测中…", "等待添加媒体"]);
   const simulationTimer = useRef<number | null>(null);
+  const importInProgress = useRef(false);
   const queueBodyRef = useRef<HTMLDivElement>(null);
   const selectionAnchorId = useRef("");
   const suppressRowClick = useRef(false);
@@ -221,10 +224,18 @@ export default function App() {
   }, []);
 
   async function addPaths(paths: string[]) {
-    if (!paths.length || !activePreset) return;
-    setStep(1);
-    setLastError("");
+    await importVideos(async () => paths);
+  }
+
+  async function importVideos(getPaths: () => Promise<string[]>) {
+    if (importInProgress.current || !activePreset) return;
+    importInProgress.current = true;
+    setIsImporting(true);
     try {
+      const paths = await getPaths();
+      if (!paths.length) return;
+      setStep(1);
+      setLastError("");
       const items = await probePaths(paths, activePreset.id);
       setQueue((existing) => mergeQueue(existing, items.map((item) => ({ ...item, selected: true, status: "就绪" }))));
       setLog((lines) => [`已导入 ${items.length} 个视频`, ...lines].slice(0, 120));
@@ -233,6 +244,9 @@ export default function App() {
       const message = error instanceof Error ? error.message : String(error);
       setLastError(message);
       setLog((lines) => [`导入失败：${message}`, ...lines].slice(0, 120));
+    } finally {
+      importInProgress.current = false;
+      setIsImporting(false);
     }
   }
 
@@ -611,9 +625,9 @@ export default function App() {
           <section className="queue-panel">
             <header className="queue-toolbar">
               <div className="queue-actions">
-                <button className="secondary-button" onClick={async () => addPaths(await pickVideoFiles())}><Plus size={17} />添加视频</button>
-                <button className="icon-only" aria-label="添加文件夹" title="添加文件夹" onClick={async () => addPaths(await pickFolder())}><Folder size={17} /></button>
-                <button className="quiet-action danger" disabled={!queue.length} onClick={clearQueue}><Trash2 size={16} />清空列表</button>
+                <button className="secondary-button" disabled={isImporting} onClick={() => importVideos(pickVideoFiles)}>{isImporting ? <LoaderCircle className="loading-spinner" size={17} /> : <Plus size={17} />}{isImporting ? "载入中…" : "添加视频"}</button>
+                <button className="icon-only" aria-label="添加文件夹" title="添加文件夹" disabled={isImporting} onClick={() => importVideos(pickFolder)}><Folder size={17} /></button>
+                <button className="quiet-action danger" disabled={!queue.length || isImporting} onClick={clearQueue}><Trash2 size={16} />清空列表</button>
               </div>
               <SearchField value={filter} onChange={setFilter} placeholder="搜索文件" compact />
               <div className="queue-summary">共 {queue.length} 个文件 · {formatBytes(queue.reduce((sum, item) => sum + item.sizeBytes, 0))}</div>
@@ -622,8 +636,9 @@ export default function App() {
 
             <div className="queue-head" aria-hidden="true"><span /><span>文件名</span><span>源文件信息</span><span>预计输出</span><span>状态</span><span /></div>
             <div
-              className={`queue-body ${marquee ? "is-marquee-selecting" : ""}`}
+              className={`queue-body ${marquee ? "is-marquee-selecting" : ""} ${isImporting ? "is-importing" : ""}`}
               ref={queueBodyRef}
+              aria-busy={isImporting}
               onPointerDown={beginMarquee}
               onPointerMove={moveMarquee}
               onPointerUp={endMarquee}
@@ -649,9 +664,10 @@ export default function App() {
                   </article>
                 );
               }) : (
-                <div className="empty-state"><FilePlus2 size={28} /><strong>添加视频开始压缩</strong><span>支持拖放文件或文件夹到这里</span><button className="secondary-button" onClick={async () => addPaths(await pickVideoFiles())}>选择视频</button></div>
+                <div className="empty-state"><FilePlus2 size={28} /><strong>添加视频开始压缩</strong><span>支持拖放文件或文件夹到这里</span><button className="secondary-button" disabled={isImporting} onClick={() => importVideos(pickVideoFiles)}>选择视频</button></div>
               )}
             </div>
+            {isImporting && <div className="import-loading" role="status" aria-live="polite"><LoaderCircle className="loading-spinner" size={28} /><strong>正在载入视频…</strong><span>正在读取媒体信息，请稍候</span></div>}
             <footer className="queue-footer">
               <label className="select-all" title="支持 Shift 连选、Ctrl/Cmd 多选和拖拽框选"><input type="checkbox" checked={queue.length > 0 && selectedItems.length === queue.length} onChange={(event) => setQueue((items) => items.map((item) => ({ ...item, selected: event.target.checked })))} />已选择 {selectedItems.length} / {queue.length} 个文件</label>
               <div><span>总大小：{formatBytes(totalSourceSize)}</span><strong>预计输出：{formatBytes(totalEstimatedSize)} (-{savings}%)</strong></div>
