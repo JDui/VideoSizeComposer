@@ -24,17 +24,19 @@ The following screenshots were captured from the current development build and a
 
 ## 核心流程 · Core workflow
 
-1. **添加媒体 · Add media** — 选择视频、导入文件夹，或直接拖放文件；支持批量任务。
+1. **添加媒体 · Add media** — 选择视频、导入文件夹或序列帧媒体，或直接拖放文件；支持批量任务。
 2. **选择输出 · Choose output** — 为当前任务选择预设、编码格式、分辨率、画质、色彩和输出命名策略。
 3. **开始压缩 · Start compression** — 查看预计大小、剩余时间和任务详情；编码完成、失败或取消都会进入明确的终态。
 
-1. **Add media** — Select videos, import folders, or drag and drop files into the queue.
+1. **Add media** — Select videos or image sequences, import folders, or drag and drop files into the queue.
 2. **Choose output** — Configure the selected task with a preset, codec, resolution, quality, color mode, and naming strategy.
 3. **Start compression** — Review estimated output size, remaining time, and task details. Every encode ends in an explicit completed, failed, or cancelled state.
 
 ## 功能特性 · Features
 
-- 支持 H.264、H.265/HEVC、AV1 和 ProRes 422；支持源分辨率、短边分辨率和百分比缩放。
+- 支持 H.264、H.265/HEVC、AV1 和 ProRes 422 LT；支持源分辨率、短边分辨率、10%–90% 倍率缩放和自定义宽高。
+- 支持从文件夹或任意一帧识别序列帧媒体，并可逐序列设置帧率、分辨率和像素宽幅放大率。
+- 输出封装默认保持源后缀（序列帧默认 MP4），也可选择 MP4、MOV、AVI、MKV、WebM、M4V 或 M4A。
 - 支持 8/10-bit、4:2:0/4:2:2，以及 SDR、HLG 和 HDR10 色彩模式。
 - 通过 FFmpeg `zscale` 完成 HDR/SDR 像素转换并写入匹配的色彩元数据；HDR 转换和 4:2:2 使用 CPU 路径以提高可预测性。
 - Dolby Vision 保留模式使用无损 HEVC stream copy 保留已有 RPU；该模式不允许缩放或 LUT 处理，也不会生成新的 Dolby Vision 元数据。
@@ -47,7 +49,9 @@ The following screenshots were captured from the current development build and a
 - 编码使用同目录临时文件，成功后才移动到最终路径；失败、取消时会清理临时文件。
 - 运行中的任务可以取消；任务详情、日志和错误状态保持可见。
 
-- Supports H.264, H.265/HEVC, AV1, and ProRes 422, with source-size, short-edge, and percentage scaling modes.
+- Supports H.264, H.265/HEVC, AV1, and ProRes 422 LT, with source-size, short-edge, 10%–90% scaling, and custom dimensions.
+- Detects image sequences from a folder or any selected frame, with per-sequence frame rate, resolution, and horizontal pixel-aspect controls.
+- Keeps the source container extension by default (MP4 for sequences), with MP4, MOV, AVI, MKV, WebM, M4V, and M4A overrides.
 - Supports 8/10-bit, 4:2:0/4:2:2, and SDR, HLG, and HDR10 color workflows.
 - Uses FFmpeg `zscale` for HDR/SDR pixel conversion with matching color metadata. HDR conversion and 4:2:2 use the CPU path for predictable output.
 - Dolby Vision preservation uses lossless HEVC stream copy to retain the existing RPU. Scaling and LUT processing are intentionally disabled; new Dolby Vision metadata is never synthesized.
@@ -75,7 +79,7 @@ The following screenshots were captured from the current development build and a
 - H.265 10bit（保留 HDR） · H.265 10bit (preserve HDR)
 - H.264 高画质 · H.264 high quality
 - AV1 1080p 10bit
-- ProRes 422 HQ
+- ProRes 422 LT
 - H.265 HLG 10bit
 - H.265 HDR10 10bit
 - Dolby Vision 保留导出 · Dolby Vision preservation

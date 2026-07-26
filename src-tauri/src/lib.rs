@@ -21,8 +21,11 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "3g2", "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "mxf", "ogv",
-    "ts", "webm", "wmv",
+    "3g2", "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "mxf",
+    "ogv", "ts", "webm", "wmv",
+];
+const SEQUENCE_EXTENSIONS: &[&str] = &[
+    "bmp", "dpx", "exr", "jpeg", "jpg", "png", "tga", "tif", "tiff", "webp",
 ];
 const CANCELLED_ERROR: &str = "__VSC_CANCELLED__";
 
@@ -53,12 +56,18 @@ struct Preset {
     short_edge: u32,
     #[serde(default = "default_scale_percent")]
     scale_percent: u32,
+    #[serde(default = "default_custom_width")]
+    custom_width: u32,
+    #[serde(default = "default_custom_height")]
+    custom_height: u32,
     bitrate_mode: String,
     bitrate_multiplier: f64,
-    target_bitrate_mbps: u32,
+    target_bitrate_mbps: f64,
     hardware: String,
     output_mode: String,
     output_dir: String,
+    #[serde(default = "default_output_container")]
+    output_container: String,
     naming_mode: String,
     prefix: String,
     suffix: String,
@@ -68,7 +77,10 @@ struct Preset {
     color_space: String,
     #[serde(default = "default_hdr_mode")]
     hdr_mode: String,
-    #[serde(default = "default_preset_bit_depth", deserialize_with = "deserialize_bit_depth")]
+    #[serde(
+        default = "default_preset_bit_depth",
+        deserialize_with = "deserialize_bit_depth"
+    )]
     bit_depth: String,
     #[serde(default = "default_preset_chroma")]
     chroma: String,
@@ -119,6 +131,20 @@ struct QueueItem {
     output: String,
     status: String,
     progress: u8,
+    #[serde(default = "default_media_kind")]
+    media_kind: String,
+    #[serde(default)]
+    sequence_pattern: String,
+    #[serde(default)]
+    sequence_start_number: u64,
+    #[serde(default)]
+    sequence_frame_count: u32,
+    #[serde(default = "default_sequence_fps")]
+    sequence_fps: f64,
+    #[serde(default = "default_pixel_aspect")]
+    sequence_pixel_aspect: f64,
+    #[serde(default)]
+    sequence_frames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +176,7 @@ pub fn run() {
             delete_preset,
             import_lut_files,
             probe_paths,
+            probe_sequence_paths,
             start_encode,
             cancel_encode
         ])
@@ -269,7 +296,11 @@ fn delete_preset(app: tauri::AppHandle, id: String) -> Result<Vec<Preset>, Strin
 
 #[tauri::command]
 fn import_lut_files(app: tauri::AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
-    let base = app.path().app_config_dir().map_err(|error| error.to_string())?.join("luts");
+    let base = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?
+        .join("luts");
     fs::create_dir_all(&base).map_err(|error| error.to_string())?;
     let mut imported = Vec::new();
 
@@ -282,7 +313,8 @@ fn import_lut_files(app: tauri::AppHandle, paths: Vec<String>) -> Result<Vec<Str
             continue;
         };
         let target = unique_child_path(&base, file_name);
-        fs::copy(&source, &target).map_err(|error| format!("无法导入 LUT {}: {error}", source.display()))?;
+        fs::copy(&source, &target)
+            .map_err(|error| format!("无法导入 LUT {}: {error}", source.display()))?;
         imported.push(target.to_string_lossy().to_string());
     }
 
@@ -316,6 +348,251 @@ fn probe_paths_impl(paths: Vec<String>, preset_id: String) -> Result<Vec<QueueIt
         eprintln!("probe failed: {error}");
     }
     Ok(items)
+}
+
+#[tauri::command]
+async fn probe_sequence_paths(
+    paths: Vec<String>,
+    preset_id: String,
+    default_fps: f64,
+) -> Result<Vec<QueueItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let groups = collect_sequence_groups(paths);
+        if groups.is_empty() {
+            return Err("没有找到支持的序列帧（PNG/JPEG/TIFF/BMP/WebP/EXR/DPX/TGA）".into());
+        }
+        let fps = if default_fps.is_finite() && default_fps > 0.0 {
+            default_fps
+        } else {
+            default_sequence_fps()
+        };
+        let mut items = Vec::new();
+        let mut errors = Vec::new();
+        for frames in groups {
+            match probe_sequence(&frames, &preset_id, fps) {
+                Ok(item) => items.push(item),
+                Err(error) => errors.push(error),
+            }
+        }
+        if items.is_empty() {
+            return Err(format!("无法读取序列帧信息：\n{}", errors.join("\n")));
+        }
+        Ok(items)
+    })
+    .await
+    .map_err(|error| format!("序列探测任务异常：{error}"))?
+}
+
+fn collect_sequence_groups(paths: Vec<String>) -> Vec<Vec<PathBuf>> {
+    let mut groups: HashMap<String, Vec<(u64, PathBuf)>> = HashMap::new();
+    let mut requested_keys = Vec::new();
+    let has_directory = paths.iter().any(|raw| Path::new(raw).is_dir());
+
+    for raw in paths {
+        let path = PathBuf::from(raw);
+        if path.is_dir() {
+            for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
+                let candidate = entry.path();
+                if candidate.is_file() && is_sequence_frame(candidate) {
+                    if let Some((key, frame)) = sequence_key(candidate) {
+                        groups
+                            .entry(key)
+                            .or_default()
+                            .push((frame, candidate.to_path_buf()));
+                    }
+                }
+            }
+        } else if path.is_file() && is_sequence_frame(&path) {
+            if let Some((key, _)) = sequence_key(&path) {
+                requested_keys.push(key.clone());
+                if let Some(parent) = path.parent() {
+                    if let Ok(entries) = fs::read_dir(parent) {
+                        for entry in entries.filter_map(Result::ok) {
+                            let candidate = entry.path();
+                            if candidate.is_file() && is_sequence_frame(&candidate) {
+                                if let Some((candidate_key, frame)) = sequence_key(&candidate) {
+                                    if candidate_key == key {
+                                        groups
+                                            .entry(key.clone())
+                                            .or_default()
+                                            .push((frame, candidate));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !has_directory && !requested_keys.is_empty() {
+        groups.retain(|key, _| requested_keys.contains(key));
+    }
+    let mut result: Vec<Vec<PathBuf>> = groups
+        .into_values()
+        .filter_map(|mut entries| {
+            entries.sort_by(|(left_number, left_path), (right_number, right_path)| {
+                left_number
+                    .cmp(right_number)
+                    .then_with(|| left_path.cmp(right_path))
+            });
+            entries.dedup_by(|left, right| left.1 == right.1);
+            (!entries.is_empty()).then(|| entries.into_iter().map(|(_, path)| path).collect())
+        })
+        .collect();
+    result.sort_by(|left, right| left.first().cmp(&right.first()));
+    result
+}
+
+fn sequence_key(path: &Path) -> Option<(String, u64)> {
+    let stem = path.file_stem()?.to_str()?;
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let (prefix, suffix, frame) = if let Some((prefix, digits, suffix)) = split_sequence_stem(stem)
+    {
+        (prefix, suffix, digits.parse::<u64>().unwrap_or(0))
+    } else {
+        (stem, "", 0)
+    };
+    let parent = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_string_lossy();
+    Some((
+        format!(
+            "{}|{}|{}|{}",
+            parent.to_lowercase(),
+            prefix.to_lowercase(),
+            suffix.to_lowercase(),
+            extension
+        ),
+        frame,
+    ))
+}
+
+fn split_sequence_stem(stem: &str) -> Option<(&str, &str, &str)> {
+    let chars: Vec<(usize, char)> = stem.char_indices().collect();
+    let last_index = chars
+        .iter()
+        .rposition(|(_, value)| value.is_ascii_digit())?;
+    let mut first_index = last_index;
+    while first_index > 0 && chars[first_index - 1].1.is_ascii_digit() {
+        first_index -= 1;
+    }
+    let start = chars[first_index].0;
+    let end = chars[last_index].0 + chars[last_index].1.len_utf8();
+    Some((&stem[..start], &stem[start..end], &stem[end..]))
+}
+
+fn sequence_base_name(stem: &str) -> String {
+    let (prefix, _, suffix) = split_sequence_stem(stem).unwrap_or((stem, "", ""));
+    let prefix = prefix.trim_end_matches(['_', '-', '.', ' ']);
+    let suffix = suffix.trim_start_matches(['_', '-', '.', ' ']);
+    match (prefix.is_empty(), suffix.is_empty()) {
+        (false, false) => format!("{prefix}_{suffix}"),
+        (false, true) => prefix.to_string(),
+        (true, false) => suffix.to_string(),
+        (true, true) => "sequence".into(),
+    }
+}
+
+fn is_sequence_frame(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| SEQUENCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn probe_sequence(frames: &[PathBuf], preset_id: &str, fps: f64) -> Result<QueueItem, String> {
+    let first = frames.first().ok_or_else(|| "空序列".to_string())?;
+    let mut item = probe_video(first, preset_id)?;
+    let size_bytes = frames
+        .iter()
+        .filter_map(|path| path.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    let (start_number, end_number) = (
+        sequence_key(first).map(|(_, frame)| frame).unwrap_or(0),
+        frames
+            .last()
+            .and_then(|path| sequence_key(path))
+            .map(|(_, frame)| frame)
+            .unwrap_or(0),
+    );
+    let extension = first
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image")
+        .to_ascii_uppercase();
+    let stem = first
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sequence");
+    let display_stem = sequence_base_name(stem);
+    item.file_name = if frames.len() > 1 {
+        format!(
+            "{display_stem} [{start_number}–{end_number}].{}",
+            extension.to_ascii_lowercase()
+        )
+    } else {
+        first
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("sequence")
+            .to_string()
+    };
+    item.codec = format!("{extension} 序列");
+    item.fps = format_fps(fps);
+    item.bitrate = if frames.len() > 0 {
+        ((size_bytes as f64 * 8.0) / (frames.len() as f64 / fps)).max(0.0) as u64
+    } else {
+        0
+    };
+    item.duration = frames.len() as f64 / fps;
+    item.size_bytes = size_bytes;
+    item.media_kind = "sequence".into();
+    item.sequence_pattern = sequence_display_pattern(first);
+    item.sequence_start_number = start_number;
+    item.sequence_frame_count = frames.len() as u32;
+    item.sequence_fps = fps;
+    item.sequence_pixel_aspect = default_pixel_aspect();
+    item.sequence_frames = frames
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    item.audio_tracks = 0;
+    item.subtitle_tracks = 0;
+    item.is_panorama = false;
+    item.panorama_tagged = false;
+    Ok(item)
+}
+
+fn sequence_display_pattern(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sequence");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let Some((prefix, digits, suffix)) = split_sequence_stem(stem) else {
+        return format!("{stem}.{extension}");
+    };
+    format!("{prefix}%0{}d{suffix}.{extension}", digits.len())
+}
+
+fn format_fps(fps: f64) -> String {
+    if (fps.fract()).abs() < 0.001 {
+        format!("{fps:.0} fps")
+    } else {
+        format!(
+            "{} fps",
+            format!("{fps:.3}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+        )
+    }
 }
 
 #[tauri::command]
@@ -365,10 +642,26 @@ fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
         validate_job(job)?;
         let source = Path::new(&job.item.source);
         if !source.is_file() {
-            return Err(format!("源视频不存在：{}", source.display()));
+            return Err(format!("源媒体不存在：{}", source.display()));
+        }
+        if job.item.media_kind == "sequence"
+            && (job.item.sequence_frames.is_empty()
+                || job
+                    .item
+                    .sequence_frames
+                    .iter()
+                    .any(|frame| !Path::new(frame).is_file()))
+        {
+            return Err(format!(
+                "序列“{}”包含缺失帧，请重新载入",
+                job.item.file_name
+            ));
         }
         let output = build_output_path(&job.item, &job.preset);
-        let directory = output.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let directory = output
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         fs::create_dir_all(&directory)
             .map_err(|error| format!("无法创建输出目录 {}：{error}", directory.display()))?;
         let probe = directory.join(format!(".vsc-write-test-{}.tmp", Uuid::new_v4()));
@@ -386,8 +679,9 @@ fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
     }
 
     for (directory, required) in required_by_directory {
-        let available = fs2::available_space(&directory)
-            .map_err(|error| format!("无法读取输出目录剩余空间 {}：{error}", directory.display()))?;
+        let available = fs2::available_space(&directory).map_err(|error| {
+            format!("无法读取输出目录剩余空间 {}：{error}", directory.display())
+        })?;
         let reserve = 64 * 1024 * 1024;
         if available < required.saturating_add(reserve) {
             return Err(format!(
@@ -408,7 +702,10 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
     if !matches!(preset.color_space.as_str(), "source" | "rec709" | "rec2020") {
         return Err(format!("不支持的色彩空间：{}", preset.color_space));
     }
-    if !matches!(preset.hdr_mode.as_str(), "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision") {
+    if !matches!(
+        preset.hdr_mode.as_str(),
+        "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision"
+    ) {
         return Err(format!("不支持的 HDR 模式：{}", preset.hdr_mode));
     }
     if !matches!(preset.bit_depth.as_str(), "source" | "8" | "10") {
@@ -417,13 +714,20 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
     if !matches!(preset.chroma.as_str(), "source" | "420" | "422") {
         return Err(format!("不支持的色度采样：{}", preset.chroma));
     }
+    if !matches!(
+        preset.output_container.as_str(),
+        "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a"
+    ) {
+        return Err(format!("不支持的封装格式：{}", preset.output_container));
+    }
     if preset.lut_enabled && !Path::new(&preset.lut_name).is_file() {
         return Err(format!("LUT 文件不存在：{}", preset.lut_name));
     }
     if preset.lut_enabled && !filter_available("lut3d") {
         return Err("当前 FFmpeg 不包含 lut3d 滤镜，无法套用 LUT".into());
     }
-    if (preset.color_space != "source" || !matches!(preset.hdr_mode.as_str(), "source" | "dolby_vision"))
+    if (preset.color_space != "source"
+        || !matches!(preset.hdr_mode.as_str(), "source" | "dolby_vision"))
         && !filter_available("zscale")
     {
         return Err("当前 FFmpeg 不包含 zscale 滤镜，无法执行 HDR/色彩转换".into());
@@ -439,14 +743,30 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
 
 fn validate_job(job: &EncodeJob) -> Result<(), String> {
     validate_preset(&job.preset)?;
+    let container = output_extension(&job.item, &job.preset);
+    if container == "m4a" && job.item.audio_tracks == 0 {
+        return Err(format!("“{}”没有音轨，不能导出为 M4A", job.item.file_name));
+    }
+    if container == "webm" && job.preset.codec != "av1" {
+        return Err(format!(
+            "WebM 封装当前仅支持 AV1 输出；“{}”请改用 AV1 或选择 MP4/MOV/MKV",
+            job.item.file_name
+        ));
+    }
     if matches!(job.preset.hdr_mode.as_str(), "hlg" | "hdr10")
         && resolved_bit_depth(&job.item, &job.preset) != 10
     {
-        return Err(format!("{} 的原视频不是 10-bit，HLG/HDR10 输出请明确选择 10-bit", job.item.file_name));
+        return Err(format!(
+            "{} 的原视频不是 10-bit，HLG/HDR10 输出请明确选择 10-bit",
+            job.item.file_name
+        ));
     }
     if job.preset.hdr_mode == "dolby_vision" {
         if job.item.hdr_mode != "dolby_vision" {
-            return Err(format!("{} 不是 Dolby Vision 源视频，无法执行杜比视界保留导出", job.item.file_name));
+            return Err(format!(
+                "{} 不是 Dolby Vision 源视频，无法执行杜比视界保留导出",
+                job.item.file_name
+            ));
         }
         if job.preset.codec != "h265"
             || job.preset.resolution_mode != "source"
@@ -502,31 +822,44 @@ fn emit_cancelled(app: &tauri::AppHandle, item_id: String) {
 
 fn default_presets() -> Vec<Preset> {
     vec![
-        preset_with_defaults("h265-source-30", "H.265 原视频参数 30%码率", "h265", "_h265_source"),
+        preset_with_defaults(
+            "h265-source-30",
+            "H.265 原视频参数 30%码率",
+            "h265",
+            "_h265_source",
+        ),
         {
-            let mut preset = preset_with_defaults("h264-source-30", "H.264 原分辨率 30%码率", "h264", "_h264_30pct");
+            let mut preset = preset_with_defaults(
+                "h264-source-30",
+                "H.264 原分辨率 30%码率",
+                "h264",
+                "_h264_30pct",
+            );
             preset.bit_depth = "8".into();
             preset
         },
         {
-            let mut preset = preset_with_defaults("av1-1080-10bit", "AV1 1080p 10bit", "av1", "_av1_1080p");
+            let mut preset =
+                preset_with_defaults("av1-1080-10bit", "AV1 1080p 10bit", "av1", "_av1_1080p");
             preset.resolution_mode = "short_edge".into();
             preset.short_edge = 1080;
             preset.bitrate_mode = "target_mbps".into();
-            preset.target_bitrate_mbps = 8;
+            preset.target_bitrate_mbps = 8.0;
             preset.bit_depth = "10".into();
             preset
         },
         {
-            let mut preset = preset_with_defaults("prores-422-hq", "ProRes 422 HQ", "prores", "_prores422");
+            let mut preset =
+                preset_with_defaults("prores-422-lt", "ProRes 422 LT", "prores", "_prores422lt");
             preset.hardware = "cpu".into();
             preset.bitrate_multiplier = 1.0;
-            preset.target_bitrate_mbps = 100;
+            preset.target_bitrate_mbps = 100.0;
             preset.chroma = "422".into();
             preset
         },
         {
-            let mut preset = preset_with_defaults("h265-hlg-10bit", "H.265 HLG 10bit", "h265", "_hlg");
+            let mut preset =
+                preset_with_defaults("h265-hlg-10bit", "H.265 HLG 10bit", "h265", "_hlg");
             preset.color_space = "rec2020".into();
             preset.hdr_mode = "hlg".into();
             preset.bit_depth = "10".into();
@@ -534,7 +867,8 @@ fn default_presets() -> Vec<Preset> {
             preset
         },
         {
-            let mut preset = preset_with_defaults("h265-hdr10-10bit", "H.265 HDR10 10bit", "h265", "_hdr10");
+            let mut preset =
+                preset_with_defaults("h265-hdr10-10bit", "H.265 HDR10 10bit", "h265", "_hdr10");
             preset.color_space = "rec2020".into();
             preset.hdr_mode = "hdr10".into();
             preset.bit_depth = "10".into();
@@ -542,7 +876,12 @@ fn default_presets() -> Vec<Preset> {
             preset
         },
         {
-            let mut preset = preset_with_defaults("dolby-vision-preserve", "Dolby Vision 保留导出", "h265", "_dovi");
+            let mut preset = preset_with_defaults(
+                "dolby-vision-preserve",
+                "Dolby Vision 保留导出",
+                "h265",
+                "_dovi",
+            );
             preset.hdr_mode = "dolby_vision".into();
             preset.bit_depth = "10".into();
             preset.chroma = "420".into();
@@ -559,12 +898,19 @@ fn preset_with_defaults(id: &str, name: &str, codec: &str, suffix: &str) -> Pres
         resolution_mode: "source".into(),
         short_edge: default_short_edge(),
         scale_percent: default_scale_percent(),
+        custom_width: default_custom_width(),
+        custom_height: default_custom_height(),
         bitrate_mode: "source_multiplier".into(),
         bitrate_multiplier: 0.30,
-        target_bitrate_mbps: 20,
+        target_bitrate_mbps: 20.0,
         hardware: "auto".into(),
         output_mode: "subfolder".into(),
         output_dir: String::new(),
+        output_container: if codec == "prores" {
+            "mov".into()
+        } else {
+            default_output_container()
+        },
         naming_mode: "suffix_prefix".into(),
         prefix: String::new(),
         suffix: suffix.into(),
@@ -587,6 +933,30 @@ fn default_short_edge() -> u32 {
 
 fn default_scale_percent() -> u32 {
     50
+}
+
+fn default_custom_width() -> u32 {
+    1920
+}
+
+fn default_custom_height() -> u32 {
+    1080
+}
+
+fn default_output_container() -> String {
+    "source".into()
+}
+
+fn default_media_kind() -> String {
+    "video".into()
+}
+
+fn default_sequence_fps() -> f64 {
+    30.0
+}
+
+fn default_pixel_aspect() -> f64 {
+    1.0
 }
 
 fn default_color_space() -> String {
@@ -681,7 +1051,12 @@ fn is_video(path: &Path) -> bool {
 fn is_lut(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
-        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "cube" | "3dl" | "lut"))
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "cube" | "3dl" | "lut"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -692,8 +1067,14 @@ fn unique_child_path(dir: &Path, file_name: &str) -> PathBuf {
     }
 
     let path = Path::new(file_name);
-    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("lut");
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("cube");
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("lut");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cube");
     for index in 1..10_000 {
         let candidate = dir.join(format!("{stem}-{index}.{extension}"));
         if !candidate.exists() {
@@ -705,7 +1086,14 @@ fn unique_child_path(dir: &Path, file_name: &str) -> PathBuf {
 
 fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
     let output = command_with_hidden_window(resolve_tool("ffprobe"))
-        .args(["-v", "error", "-show_format", "-show_streams", "-print_format", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_format",
+            "-show_streams",
+            "-print_format",
+            "json",
+        ])
         .arg(path)
         .output()
         .map_err(|error| error.to_string())?;
@@ -717,11 +1105,19 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
     let json: Value = serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
     let video = json["streams"]
         .as_array()
-        .and_then(|streams| streams.iter().find(|stream| stream["codec_type"] == "video"))
+        .and_then(|streams| {
+            streams
+                .iter()
+                .find(|stream| stream["codec_type"] == "video")
+        })
         .cloned()
         .unwrap_or(Value::Null);
     let format = &json["format"];
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("video").to_string();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("video")
+        .to_string();
     let bit_rate = video["bit_rate"]
         .as_str()
         .or_else(|| format["bit_rate"].as_str())
@@ -741,10 +1137,18 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         id: Uuid::new_v4().to_string(),
         source: path.to_string_lossy().to_string(),
         file_name,
-        codec: video["codec_name"].as_str().unwrap_or("unknown").to_uppercase(),
+        codec: video["codec_name"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_uppercase(),
         width: video["width"].as_u64().unwrap_or(0) as u32,
         height: video["height"].as_u64().unwrap_or(0) as u32,
-        fps: fps_label(video["avg_frame_rate"].as_str().or_else(|| video["r_frame_rate"].as_str()).unwrap_or("")),
+        fps: fps_label(
+            video["avg_frame_rate"]
+                .as_str()
+                .or_else(|| video["r_frame_rate"].as_str())
+                .unwrap_or(""),
+        ),
         bitrate: bit_rate,
         duration,
         size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
@@ -760,7 +1164,10 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
             .to_string(),
         color_transfer,
         hdr_mode,
-        audio_tracks: streams.iter().filter(|stream| stream["codec_type"] == "audio").count() as u32,
+        audio_tracks: streams
+            .iter()
+            .filter(|stream| stream["codec_type"] == "audio")
+            .count() as u32,
         subtitle_tracks: streams
             .iter()
             .filter(|stream| stream["codec_type"] == "subtitle")
@@ -770,6 +1177,13 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         output: String::new(),
         status: "等待中".into(),
         progress: 0,
+        media_kind: default_media_kind(),
+        sequence_pattern: String::new(),
+        sequence_start_number: 0,
+        sequence_frame_count: 0,
+        sequence_fps: default_sequence_fps(),
+        sequence_pixel_aspect: default_pixel_aspect(),
+        sequence_frames: Vec::new(),
     })
 }
 
@@ -781,13 +1195,7 @@ fn generate_thumbnail(path: &Path, duration: f64) -> String {
     };
     let seek = format!("{seek_seconds:.3}");
     let output = command_with_hidden_window(resolve_tool("ffmpeg"))
-        .args([
-            "-v",
-            "error",
-            "-ss",
-            seek.as_str(),
-            "-i",
-        ])
+        .args(["-v", "error", "-ss", seek.as_str(), "-i"])
         .arg(path)
         .args([
             "-frames:v",
@@ -804,9 +1212,20 @@ fn generate_thumbnail(path: &Path, duration: f64) -> String {
 
     match output {
         Ok(output) if output.status.success() && !output.stdout.is_empty() => {
-            format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(output.stdout))
+            format!(
+                "data:image/jpeg;base64,{}",
+                BASE64_STANDARD.encode(output.stdout)
+            )
         }
         _ => String::new(),
+    }
+}
+
+struct TemporaryFileGuard(PathBuf);
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -823,7 +1242,21 @@ fn encode_job(
         fs::create_dir_all(parent).map_err(|error| (item_id.clone(), error.to_string()))?;
     }
 
-    let args = build_ffmpeg_args(&job.item, &job.preset, &temporary_output);
+    let sequence_list = if job.item.media_kind == "sequence" {
+        Some(
+            write_sequence_concat_file(&job.item, &temporary_output)
+                .map_err(|error| (item_id.clone(), error))?,
+        )
+    } else {
+        None
+    };
+    let _sequence_list_guard = sequence_list.clone().map(TemporaryFileGuard);
+    let args = build_ffmpeg_args_with_sequence(
+        &job.item,
+        &job.preset,
+        &temporary_output,
+        sequence_list.as_deref(),
+    );
     let _ = app.emit(
         "encode-progress",
         EncodeProgress {
@@ -842,10 +1275,18 @@ fn encode_job(
             emit_cancelled(app, item_id);
             return Ok(());
         }
-        if job.preset.cpu_fallback && job.preset.hardware != "cpu" && job.preset.hdr_mode != "dolby_vision" {
+        if job.preset.cpu_fallback
+            && job.preset.hardware != "cpu"
+            && job.preset.hdr_mode != "dolby_vision"
+        {
             let mut cpu_preset = job.preset.clone();
             cpu_preset.hardware = "cpu".into();
-            let cpu_args = build_ffmpeg_args(&job.item, &cpu_preset, &temporary_output);
+            let cpu_args = build_ffmpeg_args_with_sequence(
+                &job.item,
+                &cpu_preset,
+                &temporary_output,
+                sequence_list.as_deref(),
+            );
             let _ = app.emit(
                 "encode-progress",
                 EncodeProgress {
@@ -863,7 +1304,10 @@ fn encode_job(
                     emit_cancelled(app, item_id);
                     return Ok(());
                 }
-                return Err((item_id.clone(), format!("{first_error}\nCPU 回退失败: {error}")));
+                return Err((
+                    item_id.clone(),
+                    format!("{first_error}\nCPU 回退失败: {error}"),
+                ));
             }
         } else {
             let _ = fs::remove_file(&temporary_output);
@@ -877,7 +1321,7 @@ fn encode_job(
         return Ok(());
     }
 
-    if job.preset.keep_panorama && job.item.is_panorama {
+    if job.preset.keep_panorama && job.item.is_panorama && is_isobmff_path(&temporary_output) {
         if let Err(error) = inject_spherical_metadata(&temporary_output) {
             let _ = fs::remove_file(&temporary_output);
             return Err((item_id, format!("无法写入标准全景元数据: {error}")));
@@ -931,9 +1375,10 @@ fn encode_job(
             },
             output: Some(output.to_string_lossy().to_string()),
             ok: Some(true),
-            message: job.preset.keep_times.then(|| {
-                "输出完成；创建日期和修改时间已恢复为源视频时间".into()
-            }),
+            message: job
+                .preset
+                .keep_times
+                .then(|| "输出完成；创建日期和修改时间已恢复为源视频时间".into()),
         },
     );
     Ok(())
@@ -1003,18 +1448,65 @@ fn build_output_path(item: &QueueItem, preset: &Preset) -> PathBuf {
     let source = PathBuf::from(&item.source);
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     let output_dir = match preset.output_mode.as_str() {
-        "single_folder" if !preset.output_dir.trim().is_empty() => PathBuf::from(&preset.output_dir),
+        "single_folder" if !preset.output_dir.trim().is_empty() => {
+            PathBuf::from(&preset.output_dir)
+        }
         "in_place" => parent.to_path_buf(),
         _ => parent.join("VideoSizeComposer"),
     };
-    let stem = source.file_stem().and_then(|value| value.to_str()).unwrap_or("output");
+    let source_stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let sequence_stem;
+    let stem = if item.media_kind == "sequence" {
+        sequence_stem = sequence_base_name(source_stem);
+        if sequence_stem.is_empty() {
+            "sequence"
+        } else {
+            &sequence_stem
+        }
+    } else {
+        source_stem
+    };
     let name = if preset.naming_mode == "suffix_prefix" {
         format!("{}{}{}", preset.prefix, stem, preset.suffix)
     } else {
         stem.to_string()
     };
-    let extension = if preset.codec == "prores" { "mov" } else { "mp4" };
+    let extension = output_extension(item, preset);
     output_dir.join(format!("{name}.{extension}"))
+}
+
+fn output_extension(item: &QueueItem, preset: &Preset) -> String {
+    if preset.output_container != "source" {
+        return preset.output_container.clone();
+    }
+    if item.media_kind == "sequence" {
+        return "mp4".into();
+    }
+    Path::new(&item.source)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(if preset.codec == "prores" {
+            "mov"
+        } else {
+            "mp4"
+        })
+        .to_ascii_lowercase()
+}
+
+fn is_isobmff_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "m4v"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn unique_output_path(base: &Path) -> PathBuf {
@@ -1022,8 +1514,14 @@ fn unique_output_path(base: &Path) -> PathBuf {
         return base.to_path_buf();
     }
     let parent = base.parent().unwrap_or_else(|| Path::new("."));
-    let stem = base.file_stem().and_then(|value| value.to_str()).unwrap_or("output");
-    let extension = base.extension().and_then(|value| value.to_str()).unwrap_or("mp4");
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let extension = base
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
     for index in 1..10_000 {
         let candidate = parent.join(format!("{stem}-{index}.{extension}"));
         if !candidate.exists() {
@@ -1046,7 +1544,32 @@ fn temporary_output_path(final_output: &Path) -> PathBuf {
     parent.join(format!(".{stem}.vsc-part-{}.{}", Uuid::new_v4(), extension))
 }
 
+fn write_sequence_concat_file(item: &QueueItem, output: &Path) -> Result<PathBuf, String> {
+    if item.sequence_frames.is_empty() {
+        return Err(format!("序列“{}”没有可用帧", item.file_name));
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let path = parent.join(format!(".vsc-sequence-{}.txt", Uuid::new_v4()));
+    let mut text = String::from("ffconcat version 1.0\n");
+    for frame in &item.sequence_frames {
+        let escaped = frame.replace('\\', "/").replace('\'', "'\\''");
+        text.push_str(&format!("file '{escaped}'\n"));
+    }
+    fs::write(&path, text).map_err(|error| format!("无法创建序列帧清单：{error}"))?;
+    Ok(path)
+}
+
+#[cfg(test)]
 fn build_ffmpeg_args(item: &QueueItem, preset: &Preset, output: &Path) -> Vec<String> {
+    build_ffmpeg_args_with_sequence(item, preset, output, None)
+}
+
+fn build_ffmpeg_args_with_sequence(
+    item: &QueueItem,
+    preset: &Preset,
+    output: &Path,
+    sequence_list: Option<&Path>,
+) -> Vec<String> {
     let encoder = video_encoder(item, preset);
     let dolby_vision_copy = preset.hdr_mode == "dolby_vision";
     let mut args = vec![
@@ -1055,15 +1578,44 @@ fn build_ffmpeg_args(item: &QueueItem, preset: &Preset, output: &Path) -> Vec<St
         "-progress".into(),
         "pipe:2".into(),
         "-nostats".into(),
-        "-i".into(),
-        item.source.clone(),
+    ];
+    if let Some(list) = sequence_list {
+        args.extend([
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            list.to_string_lossy().to_string(),
+            "-r".into(),
+            format!("{:.6}", item.sequence_fps.max(0.001)),
+        ]);
+    } else {
+        args.extend(["-i".into(), item.source.clone()]);
+    }
+
+    if output_extension(item, preset) == "m4a" {
+        args.extend([
+            "-map".into(),
+            "0:a:0?".into(),
+            "-vn".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "320k".into(),
+            output.to_string_lossy().to_string(),
+        ]);
+        return args;
+    }
+
+    args.extend([
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
         "0:a?".into(),
         "-map_metadata".into(),
         "0".into(),
-    ];
+    ]);
 
     if dolby_vision_copy {
         args.extend(["-c:v".into(), "copy".into(), "-tag:v".into(), "hvc1".into()]);
@@ -1074,7 +1626,12 @@ fn build_ffmpeg_args(item: &QueueItem, preset: &Preset, output: &Path) -> Vec<St
         }
 
         if preset.codec == "prores" {
-            args.extend(["-profile:v".into(), "3".into(), "-pix_fmt".into(), "yuv422p10le".into()]);
+            args.extend([
+                "-profile:v".into(),
+                "1".into(),
+                "-pix_fmt".into(),
+                "yuv422p10le".into(),
+            ]);
         } else {
             args.extend(["-b:v".into(), target_bitrate(item, preset).to_string()]);
             args.extend(["-pix_fmt".into(), pixel_format(item, preset)]);
@@ -1082,16 +1639,33 @@ fn build_ffmpeg_args(item: &QueueItem, preset: &Preset, output: &Path) -> Vec<St
 
         match encoder.as_str() {
             "libx265" | "libx264" => args.extend(["-preset".into(), "medium".into()]),
-            "libaom-av1" => args.extend(["-cpu-used".into(), "6".into(), "-row-mt".into(), "1".into()]),
+            "libaom-av1" => {
+                args.extend(["-cpu-used".into(), "6".into(), "-row-mt".into(), "1".into()])
+            }
             _ => {}
         }
         add_color_output_args(&mut args, item, preset, &encoder);
-        if preset.codec == "h265" {
+        if preset.codec == "h265"
+            && matches!(
+                output_extension(item, preset).as_str(),
+                "mp4" | "mov" | "m4v"
+            )
+        {
             args.extend(["-tag:v".into(), "hvc1".into()]);
         }
     }
 
-    args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "320k".into()]);
+    let audio_codec = if output_extension(item, preset) == "webm" {
+        "libopus"
+    } else {
+        "aac"
+    };
+    args.extend([
+        "-c:a".into(),
+        audio_codec.into(),
+        "-b:a".into(),
+        "320k".into(),
+    ]);
     if preset.keep_panorama && item.is_panorama {
         args.extend([
             "-metadata:s:v:0".into(),
@@ -1100,18 +1674,32 @@ fn build_ffmpeg_args(item: &QueueItem, preset: &Preset, output: &Path) -> Vec<St
             "stereo_mode=mono".into(),
         ]);
     }
-    let movflags = if preset.keep_panorama && item.is_panorama {
-        "+use_metadata_tags"
-    } else {
-        "+faststart+use_metadata_tags"
-    };
-    args.extend(["-movflags".into(), movflags.into()]);
+    if matches!(
+        output_extension(item, preset).as_str(),
+        "mp4" | "mov" | "m4v"
+    ) {
+        let movflags = if preset.keep_panorama && item.is_panorama {
+            "+use_metadata_tags"
+        } else {
+            "+faststart+use_metadata_tags"
+        };
+        args.extend(["-movflags".into(), movflags.into()]);
+    }
     args.push(output.to_string_lossy().to_string());
     args
 }
 
 fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
     let mut filters = Vec::new();
+    if item.media_kind == "sequence" {
+        filters.push(format!("setpts=N/({:.6}*TB)", item.sequence_fps.max(0.001)));
+        filters.push(format!(
+            "scale={}:{},setsar={:.6}",
+            item.width.max(2),
+            item.height.max(2),
+            item.sequence_pixel_aspect.max(0.001)
+        ));
+    }
     match preset.resolution_mode.as_str() {
         "short_edge" => {
             let edge = preset.short_edge.max(120);
@@ -1120,8 +1708,15 @@ fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
             ));
         }
         "scale_percent" => {
-            let ratio = (preset.scale_percent.clamp(10, 100) as f64) / 100.0;
+            let ratio = (preset.scale_percent.clamp(10, 90) as f64) / 100.0;
             filters.push(format!("scale=trunc(iw*{ratio}/2)*2:trunc(ih*{ratio}/2)*2"));
+        }
+        "custom" => {
+            let width = preset.custom_width.max(2) / 2 * 2;
+            let height = preset.custom_height.max(2) / 2 * 2;
+            filters.push(format!(
+                "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            ));
         }
         _ => {}
     }
@@ -1156,7 +1751,11 @@ fn color_conversion_filter(item: &QueueItem, preset: &Preset) -> Option<String> 
     }
     let input_primaries = normalized_primaries(&item.color_space);
     let input_transfer = normalized_transfer(&item.color_transfer);
-    let input_matrix = if input_primaries == "bt2020" { "bt2020nc" } else { "bt709" };
+    let input_matrix = if input_primaries == "bt2020" {
+        "bt2020nc"
+    } else {
+        "bt709"
+    };
     let input = format!(
         "zscale=primariesin={input_primaries}:transferin={input_transfer}:matrixin={input_matrix}:rangein=tv:primaries={input_primaries}:transfer=linear:npl=100,format=gbrpf32le"
     );
@@ -1192,7 +1791,11 @@ fn color_conversion_filter(item: &QueueItem, preset: &Preset) -> Option<String> 
 }
 
 fn normalized_primaries(value: &str) -> &'static str {
-    if value.contains("2020") { "bt2020" } else { "bt709" }
+    if value.contains("2020") {
+        "bt2020"
+    } else {
+        "bt709"
+    }
 }
 
 fn normalized_transfer(value: &str) -> &'static str {
@@ -1211,14 +1814,22 @@ fn add_color_output_args(args: &mut Vec<String>, item: &QueueItem, preset: &Pres
         _ => (
             normalized_primaries(&item.color_space),
             normalized_transfer(&item.color_transfer),
-            if normalized_primaries(&item.color_space) == "bt2020" { "bt2020nc" } else { "bt709" },
+            if normalized_primaries(&item.color_space) == "bt2020" {
+                "bt2020nc"
+            } else {
+                "bt709"
+            },
         ),
     };
     args.extend([
-        "-color_primaries".into(), primaries.into(),
-        "-color_trc".into(), transfer.into(),
-        "-colorspace".into(), matrix.into(),
-        "-color_range".into(), "tv".into(),
+        "-color_primaries".into(),
+        primaries.into(),
+        "-color_trc".into(),
+        transfer.into(),
+        "-colorspace".into(),
+        matrix.into(),
+        "-color_range".into(),
+        "tv".into(),
     ]);
     if preset.hdr_mode == "hdr10" && encoder == "libx265" {
         args.extend([
@@ -1247,11 +1858,18 @@ fn resolved_bit_depth(item: &QueueItem, preset: &Preset) -> u8 {
 }
 
 fn resolved_chroma<'a>(item: &'a QueueItem, preset: &'a Preset) -> &'a str {
-    if preset.chroma == "source" { item.chroma.as_str() } else { preset.chroma.as_str() }
+    if preset.chroma == "source" {
+        item.chroma.as_str()
+    } else {
+        preset.chroma.as_str()
+    }
 }
 
 fn pixel_format(item: &QueueItem, preset: &Preset) -> String {
-    match (resolved_bit_depth(item, preset), resolved_chroma(item, preset)) {
+    match (
+        resolved_bit_depth(item, preset),
+        resolved_chroma(item, preset),
+    ) {
         (10, "444") => "yuv444p10le",
         (10, "422") => "yuv422p10le",
         (10, _) => "yuv420p10le",
@@ -1277,9 +1895,15 @@ fn video_encoder(item: &QueueItem, preset: &Preset) -> String {
         .into();
     }
     match (preset.codec.as_str(), preset.hardware.as_str()) {
-        ("h265", "auto") if cfg!(target_os = "windows") && encoder_available("hevc_nvenc") => "hevc_nvenc",
-        ("h264", "auto") if cfg!(target_os = "windows") && encoder_available("h264_nvenc") => "h264_nvenc",
-        ("av1", "auto") if cfg!(target_os = "windows") && encoder_available("av1_nvenc") => "av1_nvenc",
+        ("h265", "auto") if cfg!(target_os = "windows") && encoder_available("hevc_nvenc") => {
+            "hevc_nvenc"
+        }
+        ("h264", "auto") if cfg!(target_os = "windows") && encoder_available("h264_nvenc") => {
+            "h264_nvenc"
+        }
+        ("av1", "auto") if cfg!(target_os = "windows") && encoder_available("av1_nvenc") => {
+            "av1_nvenc"
+        }
         ("h265", "auto") if cfg!(target_os = "macos") && encoder_available("hevc_videotoolbox") => {
             "hevc_videotoolbox"
         }
@@ -1319,9 +1943,9 @@ fn filter_available(name: &str) -> bool {
 
 fn target_bitrate(item: &QueueItem, preset: &Preset) -> u64 {
     if preset.bitrate_mode == "source_multiplier" && item.bitrate > 0 {
-        ((item.bitrate as f64) * preset.bitrate_multiplier).max(100_000.0) as u64
+        ((item.bitrate as f64) * preset.bitrate_multiplier).max(1.0) as u64
     } else {
-        (preset.target_bitrate_mbps.max(1) as u64) * 1_000_000
+        (preset.target_bitrate_mbps * 1_000_000.0).max(1.0) as u64
     }
 }
 
@@ -1331,7 +1955,8 @@ fn preserve_times(source: &Path, output: &Path) -> Result<(), String> {
     let created = metadata
         .created()
         .map_err(|error| format!("无法读取源文件创建日期：{error}"))?;
-    set_file_mtime(output, FileTime::from_system_time(modified)).map_err(|error| error.to_string())?;
+    set_file_mtime(output, FileTime::from_system_time(modified))
+        .map_err(|error| error.to_string())?;
     #[cfg(windows)]
     {
         set_windows_creation_time(output, created)?;
@@ -1352,8 +1977,12 @@ fn preserve_times(source: &Path, output: &Path) -> Result<(), String> {
 fn verify_preserved_times(source: &Path, output: &Path) -> Result<(), String> {
     let source_metadata = fs::metadata(source).map_err(|error| error.to_string())?;
     let output_metadata = fs::metadata(output).map_err(|error| error.to_string())?;
-    let source_modified = source_metadata.modified().map_err(|error| error.to_string())?;
-    let output_modified = output_metadata.modified().map_err(|error| error.to_string())?;
+    let source_modified = source_metadata
+        .modified()
+        .map_err(|error| error.to_string())?;
+    let output_modified = output_metadata
+        .modified()
+        .map_err(|error| error.to_string())?;
     if !system_times_match(source_modified, output_modified) {
         return Err("输出文件修改时间与源视频不一致".into());
     }
@@ -1382,8 +2011,11 @@ fn set_windows_creation_time(path: &Path, created: SystemTime) -> Result<(), Str
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Storage::FileSystem::{SetFileTime, FILE_FLAG_BACKUP_SEMANTICS};
 
-    let duration = created.duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?;
-    let intervals = (duration.as_secs() + 11_644_473_600) * 10_000_000 + (duration.subsec_nanos() as u64 / 100);
+    let duration = created
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?;
+    let intervals =
+        (duration.as_secs() + 11_644_473_600) * 10_000_000 + (duration.subsec_nanos() as u64 / 100);
     let filetime = FILETIME {
         dwLowDateTime: intervals as u32,
         dwHighDateTime: (intervals >> 32) as u32,
@@ -1393,7 +2025,14 @@ fn set_windows_creation_time(path: &Path, created: SystemTime) -> Result<(), Str
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|error| error.to_string())?;
-    let ok = unsafe { SetFileTime(file.as_raw_handle() as _, &filetime, std::ptr::null(), std::ptr::null()) };
+    let ok = unsafe {
+        SetFileTime(
+            file.as_raw_handle() as _,
+            &filetime,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
     if ok == 0 {
         Err("无法设置 Windows 创建时间".into())
     } else {
@@ -1405,7 +2044,9 @@ fn set_windows_creation_time(path: &Path, created: SystemTime) -> Result<(), Str
 fn set_macos_creation_time(path: &Path, created: SystemTime) -> Result<(), String> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
-    let duration = created.duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?;
+    let duration = created
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?;
     let mut attributes = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -1462,15 +2103,25 @@ fn detect_panorama(json: &Value) -> bool {
 
 fn detect_panorama_tagged(json: &Value) -> bool {
     let text = json.to_string().to_ascii_lowercase();
-    ["spherical mapping", "equirectangular", "stereo_mode", "projection", "sv3d"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    [
+        "spherical mapping",
+        "equirectangular",
+        "stereo_mode",
+        "projection",
+        "sv3d",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn detect_panorama_shape(json: &Value) -> bool {
     json["streams"]
         .as_array()
-        .and_then(|streams| streams.iter().find(|stream| stream["codec_type"] == "video"))
+        .and_then(|streams| {
+            streams
+                .iter()
+                .find(|stream| stream["codec_type"] == "video")
+        })
         .and_then(|video| Some((video["width"].as_f64()?, video["height"].as_f64()?)))
         .map(|(width, height)| height > 0.0 && width / height >= 1.95)
         .unwrap_or(false)
@@ -1499,7 +2150,10 @@ fn read_mp4_box(data: &[u8], start: usize, end: usize) -> Option<(Mp4BoxInfo, [u
         if start + 16 > end {
             return None;
         }
-        (u64::from_be_bytes(data[start + 8..start + 16].try_into().ok()?) as usize, 16)
+        (
+            u64::from_be_bytes(data[start + 8..start + 16].try_into().ok()?) as usize,
+            16,
+        )
     } else if size32 == 0 {
         (end - start, 8)
     } else {
@@ -1508,7 +2162,14 @@ fn read_mp4_box(data: &[u8], start: usize, end: usize) -> Option<(Mp4BoxInfo, [u
     if size < header_size || start.checked_add(size)? > end {
         return None;
     }
-    Some((Mp4BoxInfo { start, size, header_size }, name))
+    Some((
+        Mp4BoxInfo {
+            start,
+            size,
+            header_size,
+        },
+        name,
+    ))
 }
 
 fn child_boxes(data: &[u8], start: usize, end: usize) -> Vec<(Mp4BoxInfo, [u8; 4])> {
@@ -1524,10 +2185,19 @@ fn child_boxes(data: &[u8], start: usize, end: usize) -> Vec<(Mp4BoxInfo, [u8; 4
     boxes
 }
 
-fn named_child(data: &[u8], parent: Mp4BoxInfo, name: &[u8; 4], prefix: usize) -> Option<Mp4BoxInfo> {
-    child_boxes(data, parent.start + parent.header_size + prefix, parent.end())
-        .into_iter()
-        .find_map(|(info, kind)| (kind == *name).then_some(info))
+fn named_child(
+    data: &[u8],
+    parent: Mp4BoxInfo,
+    name: &[u8; 4],
+    prefix: usize,
+) -> Option<Mp4BoxInfo> {
+    child_boxes(
+        data,
+        parent.start + parent.header_size + prefix,
+        parent.end(),
+    )
+    .into_iter()
+    .find_map(|(info, kind)| (kind == *name).then_some(info))
 }
 
 fn video_track_path(data: &[u8]) -> Result<Vec<Mp4BoxInfo>, String> {
@@ -1546,8 +2216,12 @@ fn video_track_path(data: &[u8]) -> Result<Vec<Mp4BoxInfo>, String> {
         if name != *b"trak" {
             continue;
         }
-        let Some(mdia) = named_child(data, trak, b"mdia", 0) else { continue };
-        let Some(hdlr) = named_child(data, mdia, b"hdlr", 0) else { continue };
+        let Some(mdia) = named_child(data, trak, b"mdia", 0) else {
+            continue;
+        };
+        let Some(hdlr) = named_child(data, mdia, b"hdlr", 0) else {
+            continue;
+        };
         let handler_pos = hdlr.start + hdlr.header_size + 8;
         if handler_pos + 4 > hdlr.end() || &data[handler_pos..handler_pos + 4] != b"vide" {
             continue;
@@ -1556,7 +2230,8 @@ fn video_track_path(data: &[u8]) -> Result<Vec<Mp4BoxInfo>, String> {
         let stbl = named_child(data, minf, b"stbl", 0).ok_or("视频轨缺少 stbl")?;
         let stsd = named_child(data, stbl, b"stsd", 0).ok_or("视频轨缺少 stsd")?;
         let sample_start = stsd.start + stsd.header_size + 8;
-        let (sample, _) = read_mp4_box(data, sample_start, stsd.end()).ok_or("无法读取视频采样描述")?;
+        let (sample, _) =
+            read_mp4_box(data, sample_start, stsd.end()).ok_or("无法读取视频采样描述")?;
         return Ok(vec![moov, trak, mdia, minf, stbl, stsd, sample]);
     }
     Err("输出文件中没有可注入的主视频轨".into())
@@ -1602,7 +2277,10 @@ fn spherical_v2_boxes() -> Vec<u8> {
 }
 
 fn spherical_v1_uuid_box() -> Vec<u8> {
-    const UUID: [u8; 16] = [0xff, 0xcc, 0x82, 0x63, 0xf8, 0x55, 0x4a, 0x93, 0x88, 0x14, 0x58, 0x7a, 0x02, 0x52, 0x1f, 0xdd];
+    const UUID: [u8; 16] = [
+        0xff, 0xcc, 0x82, 0x63, 0xf8, 0x55, 0x4a, 0x93, 0x88, 0x14, 0x58, 0x7a, 0x02, 0x52, 0x1f,
+        0xdd,
+    ];
     const XML: &str = r#"<?xml version="1.0"?><rdf:SphericalVideo xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:GSpherical="http://ns.google.com/videos/1.0/spherical/"><GSpherical:Spherical>true</GSpherical:Spherical><GSpherical:Stitched>true</GSpherical:Stitched><GSpherical:StitchingSoftware>VideoSizeComposer</GSpherical:StitchingSoftware><GSpherical:ProjectionType>equirectangular</GSpherical:ProjectionType></rdf:SphericalVideo>"#;
     let mut payload = UUID.to_vec();
     payload.extend_from_slice(XML.as_bytes());
@@ -1630,8 +2308,14 @@ fn inject_spherical_metadata(path: &Path) -> Result<(), String> {
     let path_after = video_track_path(&data)?;
     let moov = path_after[0];
     let trak = path_after[1];
-    const UUID: [u8; 16] = [0xff, 0xcc, 0x82, 0x63, 0xf8, 0x55, 0x4a, 0x93, 0x88, 0x14, 0x58, 0x7a, 0x02, 0x52, 0x1f, 0xdd];
-    if !data[trak.start..trak.end()].windows(UUID.len()).any(|window| window == UUID) {
+    const UUID: [u8; 16] = [
+        0xff, 0xcc, 0x82, 0x63, 0xf8, 0x55, 0x4a, 0x93, 0x88, 0x14, 0x58, 0x7a, 0x02, 0x52, 0x1f,
+        0xdd,
+    ];
+    if !data[trak.start..trak.end()]
+        .windows(UUID.len())
+        .any(|window| window == UUID)
+    {
         let uuid = spherical_v1_uuid_box();
         let delta = uuid.len();
         data.splice(trak.end()..trak.end(), uuid);
@@ -1677,7 +2361,15 @@ fn detect_bit_depth(video: &Value, pixel_format: &str) -> u32 {
         .as_str()
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| if pixel_format.contains("10") { 10 } else if pixel_format.contains("12") { 12 } else { 8 })
+        .unwrap_or_else(|| {
+            if pixel_format.contains("10") {
+                10
+            } else if pixel_format.contains("12") {
+                12
+            } else {
+                8
+            }
+        })
 }
 
 fn detect_chroma(pixel_format: &str) -> String {
@@ -1747,7 +2439,13 @@ fn command_with_hidden_window(program: OsString) -> Command {
 
 fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|arg| if arg.contains(' ') { format!("\"{arg}\"") } else { arg.to_string() })
+        .map(|arg| {
+            if arg.contains(' ') {
+                format!("\"{arg}\"")
+            } else {
+                arg.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1889,6 +2587,13 @@ mod tests {
             output: String::new(),
             status: "等待中".into(),
             progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
         };
 
         let mut av1 = preset_with_defaults("av1", "AV1", "av1", "_av1");
@@ -1915,7 +2620,10 @@ mod tests {
         let mut ten_bit_422_item = item.clone();
         ten_bit_422_item.bit_depth = 10;
         ten_bit_422_item.chroma = "422".into();
-        assert_eq!(pixel_format(&ten_bit_422_item, &source_preset), "yuv422p10le");
+        assert_eq!(
+            pixel_format(&ten_bit_422_item, &source_preset),
+            "yuv422p10le"
+        );
         assert_eq!(video_encoder(&ten_bit_422_item, &source_preset), "libx265");
 
         let mut hlg = av1.clone();
@@ -1932,7 +2640,7 @@ mod tests {
         let prores_args = build_ffmpeg_args(&item, &prores, &output).join(" ");
         assert!(output.ends_with("input_prores.mov"));
         assert!(prores_args.contains("prores_ks"));
-        assert!(prores_args.contains("-profile:v 3"));
+        assert!(prores_args.contains("-profile:v 1"));
         assert!(prores_args.contains("yuv422p10le"));
 
         let lut_root = std::env::temp_dir().join(format!("vsc-arg-lut-{}", Uuid::new_v4()));
@@ -1953,7 +2661,10 @@ mod tests {
         let mut dovi = preset_with_defaults("dovi", "Dolby Vision 保留", "h265", "_dovi");
         dovi.hdr_mode = "dolby_vision".into();
         dovi.resolution_mode = "source".into();
-        let dovi_job = EncodeJob { item: dovi_item.clone(), preset: dovi.clone() };
+        let dovi_job = EncodeJob {
+            item: dovi_item.clone(),
+            preset: dovi.clone(),
+        };
         assert!(validate_job(&dovi_job).is_ok());
         let dovi_args = build_ffmpeg_args(&dovi_item, &dovi, Path::new("dovi.mp4")).join(" ");
         assert!(dovi_args.contains("-c:v copy"));
@@ -1961,7 +2672,11 @@ mod tests {
         assert!(!dovi_args.contains("-vf"));
         let mut non_dovi_item = dovi_item;
         non_dovi_item.hdr_mode = "hdr10".into();
-        assert!(validate_job(&EncodeJob { item: non_dovi_item, preset: dovi }).is_err());
+        assert!(validate_job(&EncodeJob {
+            item: non_dovi_item,
+            preset: dovi
+        })
+        .is_err());
         let _ = fs::remove_dir_all(lut_root);
     }
 
@@ -1972,16 +2687,34 @@ mod tests {
         let sample = root.join("bt709-source.mp4");
         let sample_status = command_with_hidden_window(resolve_tool("ffmpeg"))
             .args([
-                "-y", "-hide_banner", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24", "-t", "0.4",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709",
-                "-colorspace", "bt709",
+                "-y",
+                "-hide_banner",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=128x72:rate=24",
+                "-t",
+                "0.4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
             ])
             .arg(&sample)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .unwrap();
-        assert!(sample_status.success(), "failed to create HDR matrix source");
+        assert!(
+            sample_status.success(),
+            "failed to create HDR matrix source"
+        );
         let item = probe_video(&sample, "hdr-matrix").unwrap();
 
         for (mode, expected_transfer) in [("hlg", "arib-std-b67"), ("hdr10", "smpte2084")] {
@@ -1990,7 +2723,7 @@ mod tests {
             preset.output_mode = "single_folder".into();
             preset.output_dir = root.join(mode).to_string_lossy().to_string();
             preset.bitrate_mode = "target_mbps".into();
-            preset.target_bitrate_mbps = 1;
+            preset.target_bitrate_mbps = 1.0;
             preset.bit_depth = "10".into();
             preset.chroma = "420".into();
             preset.color_space = "rec2020".into();
@@ -2002,7 +2735,11 @@ mod tests {
                 .stdout(Stdio::null())
                 .output()
                 .unwrap();
-            assert!(encode_output.status.success(), "{mode} encode failed: {}", String::from_utf8_lossy(&encode_output.stderr));
+            assert!(
+                encode_output.status.success(),
+                "{mode} encode failed: {}",
+                String::from_utf8_lossy(&encode_output.stderr)
+            );
             let stream = probe_output_stream(&output);
             assert_eq!(stream["codec_name"], "hevc");
             assert_eq!(stream["pix_fmt"], "yuv420p10le");
@@ -2039,7 +2776,10 @@ mod tests {
 
         assert!(is_lut(&first));
         assert!(!is_lut(&root.join("notes.txt")));
-        assert_eq!(unique_child_path(&root, "Look.cube"), root.join("Look-1.cube"));
+        assert_eq!(
+            unique_child_path(&root, "Look.cube"),
+            root.join("Look-1.cube")
+        );
         assert_eq!(unique_child_path(&root, "New.cube"), root.join("New.cube"));
 
         let _ = fs::remove_dir_all(root);
@@ -2057,11 +2797,90 @@ mod tests {
         fs::write(&b, "").unwrap();
         fs::write(&note, "").unwrap();
 
-        let files = collect_video_files(vec![root.to_string_lossy().to_string(), a.to_string_lossy().to_string()]);
+        let files = collect_video_files(vec![
+            root.to_string_lossy().to_string(),
+            a.to_string_lossy().to_string(),
+        ]);
         assert_eq!(files.len(), 2);
         assert!(files.contains(&a));
         assert!(files.contains(&b));
         assert!(!files.contains(&note));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sequence_frame_selection_groups_suffix_names_and_encodes() {
+        let root = std::env::temp_dir().join(format!("vsc-sequence-{}", Uuid::new_v4()));
+        let output_dir = root.join("encoded");
+        fs::create_dir_all(&root).unwrap();
+        let pattern = root.join("shot_%04d_left.png");
+        let create_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x36:rate=3",
+                "-frames:v",
+                "3",
+                "-threads",
+                "1",
+            ])
+            .arg(&pattern)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(create_status.success(), "failed to create sequence frames");
+
+        let selected = root.join("shot_0002_left.png");
+        let groups = collect_sequence_groups(vec![selected.to_string_lossy().to_string()]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+        let item = probe_sequence(&groups[0], "sequence-preset", 24.0).unwrap();
+        assert_eq!(item.media_kind, "sequence");
+        assert_eq!(item.sequence_pattern, "shot_%04d_left.png");
+        assert_eq!(item.sequence_frame_count, 3);
+        assert_eq!(item.file_name, "shot_left [1–3].png");
+        assert_eq!(item.fps, "24 fps");
+
+        let mut preset = preset_with_defaults("sequence-preset", "Sequence", "h264", "_encoded");
+        preset.hardware = "cpu".into();
+        preset.output_mode = "single_folder".into();
+        preset.output_dir = output_dir.to_string_lossy().to_string();
+        fs::create_dir_all(&output_dir).unwrap();
+        let output = build_output_path(&item, &preset);
+        assert!(output.ends_with("shot_left_encoded.mp4"));
+        let concat = write_sequence_concat_file(&item, &output).unwrap();
+        let args = build_ffmpeg_args_with_sequence(&item, &preset, &output, Some(&concat));
+        let encode_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(encode_status.success(), "sequence encode failed");
+        assert!(output.exists());
+        assert!(output.metadata().unwrap().len() > 0);
+        let frame_probe = command_with_hidden_window(resolve_tool("ffprobe"))
+            .args([
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(frame_probe.status.success());
+        assert_eq!(String::from_utf8_lossy(&frame_probe.stdout).trim(), "3");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2076,7 +2895,10 @@ mod tests {
         fs::write(&first, "first").unwrap();
 
         assert_eq!(unique_output_path(&base), root.join("clip_h265-2.mp4"));
-        assert_eq!(unique_output_path(&root.join("new.mp4")), root.join("new.mp4"));
+        assert_eq!(
+            unique_output_path(&root.join("new.mp4")),
+            root.join("new.mp4")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2111,18 +2933,32 @@ mod tests {
             output: String::new(),
             status: "就绪".into(),
             progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
         };
         let mut preset = preset_with_defaults("preset", "Preset", "h265", "_压缩");
         preset.prefix = "交付_".into();
-        assert_eq!(build_output_path(&item, &preset), root.join("VideoSizeComposer").join("交付_源 视频_压缩.mp4"));
+        assert_eq!(
+            build_output_path(&item, &preset),
+            root.join("VideoSizeComposer").join("交付_源 视频_压缩.mp4")
+        );
         preset.output_mode = "in_place".into();
         preset.naming_mode = "original".into();
         assert_eq!(build_output_path(&item, &preset), root.join("源 视频.mp4"));
         preset.output_mode = "single_folder".into();
         preset.output_dir = root.join("统一输出").to_string_lossy().to_string();
-        assert_eq!(build_output_path(&item, &preset), root.join("统一输出").join("源 视频.mp4"));
+        assert_eq!(
+            build_output_path(&item, &preset),
+            root.join("统一输出").join("源 视频.mp4")
+        );
 
-        let panorama_json = serde_json::json!({"streams":[{"codec_type":"video","width":4096,"height":2048}]});
+        let panorama_json =
+            serde_json::json!({"streams":[{"codec_type":"video","width":4096,"height":2048}]});
         assert!(detect_panorama(&panorama_json));
         let dovi_json = serde_json::json!({"codec_tag_string":"dvhe","side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8}]});
         assert_eq!(detect_hdr_mode(&dovi_json), "dolby_vision");
@@ -2169,7 +3005,10 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&probe.stdout).unwrap();
         assert!(detect_panorama_tagged(&json));
-        assert!(json.to_string().to_ascii_lowercase().contains("equirectangular"));
+        assert!(json
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("equirectangular"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2212,7 +3051,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("notes.txt"), "not a video").unwrap();
 
-        let error = probe_paths_impl(vec![root.to_string_lossy().to_string()], "preset".into()).unwrap_err();
+        let error = probe_paths_impl(vec![root.to_string_lossy().to_string()], "preset".into())
+            .unwrap_err();
         assert!(error.contains("没有找到支持的视频文件"));
 
         let _ = fs::remove_dir_all(root);
@@ -2254,12 +3094,21 @@ mod tests {
             output: String::new(),
             status: "就绪".into(),
             progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
         };
         preflight_jobs(&[EncodeJob { item, preset }]).unwrap();
         assert!(output_dir.is_dir());
-        assert!(fs::read_dir(&output_dir)
+        assert!(fs::read_dir(&output_dir).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".vsc-write-test-")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".vsc-write-test-")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2322,7 +3171,10 @@ mod tests {
             .unwrap();
         assert!(status.success(), "lut encode failed");
         preserve_times(&sample, &output).unwrap();
-        assert_eq!(FileTime::from_last_modification_time(&output.metadata().unwrap()), source_time);
+        assert_eq!(
+            FileTime::from_last_modification_time(&output.metadata().unwrap()),
+            source_time
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2360,7 +3212,7 @@ mod tests {
         av1.output_mode = "single_folder".into();
         av1.output_dir = root.join("av1").to_string_lossy().to_string();
         av1.bitrate_mode = "target_mbps".into();
-        av1.target_bitrate_mbps = 1;
+        av1.target_bitrate_mbps = 1.0;
         av1.bit_depth = "10".into();
         av1.chroma = "420".into();
         fs::create_dir_all(&av1.output_dir).unwrap();
@@ -2390,7 +3242,10 @@ mod tests {
             .status()
             .unwrap();
         assert!(av1_422_status.success(), "av1 4:2:2 encode failed");
-        assert_eq!(probe_output_stream(&av1_422_output)["pix_fmt"], "yuv422p10le");
+        assert_eq!(
+            probe_output_stream(&av1_422_output)["pix_fmt"],
+            "yuv422p10le"
+        );
 
         let mut prores = preset_with_defaults("prores", "ProRes 422", "prores", "_prores");
         prores.output_mode = "single_folder".into();

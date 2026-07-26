@@ -14,6 +14,7 @@ import {
   FolderOpen,
   Gauge,
   HelpCircle,
+  Images,
   LoaderCircle,
   PanelLeftClose,
   PanelLeftOpen,
@@ -43,8 +44,11 @@ import {
   pickFolder,
   pickLutFiles,
   pickOutputFolder,
+  pickSequenceFolder,
+  pickSequenceFrame,
   pickVideoFiles,
   probePaths,
+  probeSequencePaths,
   savePreset,
   savePreferences,
   startEncode
@@ -58,7 +62,7 @@ const codecLabels: Record<Codec, string> = {
   h265: "HEVC (H.265)",
   h264: "H.264 (AVC)",
   av1: "AV1",
-  prores: "ProRes 422"
+  prores: "ProRes 422 LT"
 };
 
 const presetDescriptions: Record<Codec, string> = {
@@ -89,6 +93,10 @@ export default function App() {
   const [presetDraft, setPresetDraft] = useState<Preset>();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [sequenceImportOpen, setSequenceImportOpen] = useState(false);
+  const [sequenceDraft, setSequenceDraft] = useState<QueueItem>();
+  const [qualityEditing, setQualityEditing] = useState(false);
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
   const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(loadPreferences);
   const [encodingIds, setEncodingIds] = useState<string[]>([]);
@@ -250,6 +258,52 @@ export default function App() {
     }
   }
 
+  async function importSequence(getPaths: () => Promise<string[]>) {
+    if (importInProgress.current || !activePreset) return;
+    importInProgress.current = true;
+    setIsImporting(true);
+    setSequenceImportOpen(false);
+    try {
+      const paths = await getPaths();
+      if (!paths.length) return;
+      setStep(1);
+      setLastError("");
+      const items = await probeSequencePaths(paths, activePreset.id, preferences.defaultSequenceFps);
+      setQueue((existing) => mergeQueue(existing, items.map((item) => ({
+        ...item,
+        selected: true,
+        status: "就绪",
+        output: previewOutput(item, activePreset)
+      }))));
+      setLog((lines) => [`已导入 ${items.length} 个序列帧媒体`, ...lines].slice(0, 120));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLastError(message);
+      setLog((lines) => [`序列导入失败：${message}`, ...lines].slice(0, 120));
+    } finally {
+      importInProgress.current = false;
+      setIsImporting(false);
+    }
+  }
+
+  function saveSequenceDraft() {
+    if (!sequenceDraft) return;
+    const fps = Number.isFinite(sequenceDraft.sequenceFps) ? Math.max(0.001, sequenceDraft.sequenceFps) : preferences.defaultSequenceFps;
+    const next = {
+      ...sequenceDraft,
+      width: Math.max(2, Math.round(sequenceDraft.width)),
+      height: Math.max(2, Math.round(sequenceDraft.height)),
+      sequenceFps: fps,
+      sequencePixelAspect: Math.max(0.001, sequenceDraft.sequencePixelAspect),
+      fps: `${Number(fps.toFixed(3))} fps`,
+      duration: sequenceDraft.sequenceFrameCount / fps,
+      output: activePreset ? previewOutput(sequenceDraft, activePreset) : sequenceDraft.output
+    };
+    setQueue((items) => items.map((item) => item.id === next.id ? next : item));
+    setSequenceDraft(undefined);
+    setNotice("序列设置已更新");
+  }
+
   function updateActivePreset(patch: Partial<Preset>) {
     if (!activePreset) return;
     const next = normalizePreset({ ...activePreset, ...patch });
@@ -348,8 +402,15 @@ export default function App() {
   }
 
   function commitPreferences() {
-    savePreferences(preferencesDraft);
-    setPreferences(preferencesDraft);
+    const next = {
+      ...preferencesDraft,
+      defaultSequenceFps: Number.isFinite(preferencesDraft.defaultSequenceFps) && preferencesDraft.defaultSequenceFps > 0
+        ? preferencesDraft.defaultSequenceFps
+        : defaultPreferences.defaultSequenceFps
+    };
+    savePreferences(next);
+    setPreferences(next);
+    setPreferencesDraft(next);
     setSettingsOpen(false);
     setNotice("应用设置已保存");
   }
@@ -625,7 +686,13 @@ export default function App() {
           <section className="queue-panel">
             <header className="queue-toolbar">
               <div className="queue-actions">
-                <button className="secondary-button" disabled={isImporting} onClick={() => importVideos(pickVideoFiles)}>{isImporting ? <LoaderCircle className="loading-spinner" size={17} /> : <Plus size={17} />}{isImporting ? "载入中…" : "添加视频"}</button>
+                <div className="add-media-control">
+                  <button className="secondary-button" disabled={isImporting} onClick={() => setAddMenuOpen((open) => !open)}>{isImporting ? <LoaderCircle className="loading-spinner" size={17} /> : <Plus size={17} />}{isImporting ? "载入中…" : "添加视频"}<ChevronDown size={14} /></button>
+                  {addMenuOpen && <div className="add-media-menu">
+                    <button onClick={() => { setAddMenuOpen(false); importVideos(pickVideoFiles); }}><Film size={17} /><span><strong>视频文件</strong><small>选择一个或多个视频</small></span></button>
+                    <button onClick={() => { setAddMenuOpen(false); setSequenceImportOpen(true); }}><Images size={17} /><span><strong>序列帧媒体</strong><small>选择文件夹或序列中的一帧</small></span></button>
+                  </div>}
+                </div>
                 <button className="icon-only" aria-label="添加文件夹" title="添加文件夹" disabled={isImporting} onClick={() => importVideos(pickFolder)}><Folder size={17} /></button>
                 <button className="quiet-action danger" disabled={!queue.length || isImporting} onClick={clearQueue}><Trash2 size={16} />清空列表</button>
               </div>
@@ -656,15 +723,15 @@ export default function App() {
                     onClick={(event) => handleRowClick(event, item.id)}
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
-                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 视频缩略图`} draggable={false} /> : <span className="video-thumb-fallback"><Film size={19} /></span>}<span><strong>{item.fileName}</strong><small>{formatDuration(item.duration)}</small></span></div>
-                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.isPanorama && <em>{item.panoramaTagged ? "360° 已识别" : "360° 画幅候选"}</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}</span></div>
+                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : <Film size={19} />}</span>}<span><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}</span></div>
+                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.isPanorama && <em>{item.panoramaTagged ? "360° 已识别" : "360° 画幅候选"}</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}</span></div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
                     <StatusCell item={item} />
                     <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); setDetailItemId(item.id); setDetailsOpen(true); }}><ChevronRight size={19} /></button>
                   </article>
                 );
               }) : (
-                <div className="empty-state"><FilePlus2 size={28} /><strong>添加视频开始压缩</strong><span>支持拖放文件或文件夹到这里</span><button className="secondary-button" disabled={isImporting} onClick={() => importVideos(pickVideoFiles)}>选择视频</button></div>
+                <div className="empty-state"><FilePlus2 size={28} /><strong>添加媒体开始压缩</strong><span>支持视频文件与序列帧媒体</span><button className="secondary-button" disabled={isImporting} onClick={() => setAddMenuOpen(true)}>选择媒体</button></div>
               )}
             </div>
             {isImporting && <div className="import-loading" role="status" aria-live="polite"><LoaderCircle className="loading-spinner" size={28} /><strong>正在载入视频…</strong><span>正在读取媒体信息，请稍候</span></div>}
@@ -696,14 +763,17 @@ export default function App() {
 
           <div className="settings-section">
             <h3>分辨率</h3>
-            <Setting label="尺寸"><select value={resolutionValue(activePreset)} onChange={(event) => applyResolution(event.target.value, updateActivePreset)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="50">缩放 50%</option></select></Setting>
-            <div className="locked-row"><ShieldCheck size={15} /><span>保持宽高比</span></div>
+            <Setting label="尺寸"><select value={resolutionValue(activePreset)} onChange={(event) => applyResolution(event.target.value, updateActivePreset)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="scale">缩放至倍率</option><option value="custom">自定义</option></select></Setting>
+            {activePreset?.resolutionMode === "scale_percent" && <label className="range-setting"><span>缩放倍率 <strong>{activePreset.scalePercent}%</strong></span><input type="range" min={10} max={90} value={activePreset.scalePercent} onChange={(event) => updateActivePreset({ scalePercent: Number(event.target.value) })} /><small><span>10%</span><span>90%</span></small></label>}
+            {activePreset?.resolutionMode === "custom" && <div className="dimension-grid"><Setting label="宽"><input type="number" min={2} value={activePreset.customWidth} onChange={(event) => updateActivePreset({ customWidth: Number(event.target.value) })} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={activePreset.customHeight} onChange={(event) => updateActivePreset({ customHeight: Number(event.target.value) })} /></Setting></div>}
           </div>
 
           <div className="settings-section quality-section">
             <h3>画质</h3>
             <Setting label="画质模式"><select value={activePreset?.bitrateMode ?? "source_multiplier"} onChange={(event) => updateActivePreset({ bitrateMode: event.target.value as Preset["bitrateMode"] })}><option value="source_multiplier">智能压缩</option><option value="target_mbps">指定码率</option></select></Setting>
-            <label className="range-setting"><span>预计码率 <strong>{activePreset?.bitrateMode === "target_mbps" ? `${activePreset.targetBitrateMbps} Mbps` : `${Math.round((activePreset?.bitrateMultiplier ?? .3) * 100)}% 源码率`}</strong></span><input type="range" min={10} max={80} value={activePreset?.bitrateMode === "target_mbps" ? Math.min(80, activePreset.targetBitrateMbps) : Math.round((activePreset?.bitrateMultiplier ?? .3) * 100)} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} /><small><span>更小</span><span>更清晰</span></small></label>
+            <label className="range-setting"><span>预计码率 {qualityEditing
+              ? <input className="inline-number-editor" autoFocus type="number" step={activePreset?.bitrateMode === "target_mbps" ? .01 : .1} value={activePreset?.bitrateMode === "target_mbps" ? activePreset.targetBitrateMbps : Number(((activePreset?.bitrateMultiplier ?? .3) * 100).toFixed(2))} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} onBlur={() => setQualityEditing(false)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === "Escape") setQualityEditing(false); }} />
+              : <strong title="双击手动输入" onDoubleClick={() => setQualityEditing(true)}>{activePreset?.bitrateMode === "target_mbps" ? `${activePreset.targetBitrateMbps} Mbps` : `${Number(((activePreset?.bitrateMultiplier ?? .3) * 100).toFixed(2))}% 源码率`}</strong>}</span><input type="range" min={activePreset?.bitrateMode === "target_mbps" ? .1 : 1} max={activePreset?.bitrateMode === "target_mbps" ? 150 : 95} step={activePreset?.bitrateMode === "target_mbps" ? .1 : 1} value={activePreset?.bitrateMode === "target_mbps" ? Math.min(150, Math.max(.1, activePreset.targetBitrateMbps)) : Math.min(95, Math.max(1, Math.round((activePreset?.bitrateMultiplier ?? .3) * 100)))} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} /><small><span>{activePreset?.bitrateMode === "target_mbps" ? "0.1 Mbps" : "1%"}</span><span>{activePreset?.bitrateMode === "target_mbps" ? "150 Mbps" : "95%"}</span></small></label>
           </div>
 
           <label className="time-preservation-card">
@@ -733,6 +803,7 @@ export default function App() {
           <button className="collapse-row" onClick={() => setDeliveryOpen((open) => !open)}><span>输出与命名</span><ChevronDown size={17} className={deliveryOpen ? "rotated" : ""} /></button>
           {deliveryOpen && <div className="delivery-settings">
             <Setting label="输出策略"><select value={activePreset?.outputMode ?? "subfolder"} onChange={(event) => updateActivePreset({ outputMode: event.target.value as Preset["outputMode"] })}><option value="single_folder">全部到同一目录</option><option value="in_place">原位导出</option><option value="subfolder">原位子文件夹</option></select></Setting>
+            <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option></select></Setting>
             {activePreset?.outputMode === "single_folder" && <button className="secondary-button full" onClick={chooseOutputFolder}><FolderOpen size={15} />{activePreset.outputDir ? shortPath(activePreset.outputDir) : "选择输出目录"}</button>}
             <Setting label="命名"><select value={activePreset?.namingMode ?? "suffix_prefix"} onChange={(event) => updateActivePreset({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
             {activePreset?.namingMode === "suffix_prefix" && <div className="naming-grid"><Setting label="前缀"><input value={activePreset.prefix} onChange={(event) => updateActivePreset({ prefix: event.target.value })} placeholder="可选" /></Setting><Setting label="后缀"><input value={activePreset.suffix} onChange={(event) => updateActivePreset({ suffix: event.target.value })} placeholder="_compressed" /></Setting></div>}
@@ -772,6 +843,7 @@ export default function App() {
         <div className="modal-grid two-columns">
           <Setting label="默认编码设备"><select value={preferencesDraft.defaultHardware} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: event.target.value as Hardware }))}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
           <Setting label="默认输出策略"><select value={preferencesDraft.defaultOutputMode} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultOutputMode: event.target.value as Preset["outputMode"] }))}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
+          <Setting label="序列帧默认帧率"><input type="number" min={0.001} step={0.001} value={preferencesDraft.defaultSequenceFps} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultSequenceFps: Number(event.target.value) }))} /></Setting>
         </div>
         {preferencesDraft.defaultOutputMode === "single_folder" && <button className="secondary-button full" onClick={chooseDefaultOutputFolder}><FolderOpen size={15} />{preferencesDraft.defaultOutputDir ? shortPath(preferencesDraft.defaultOutputDir) : "选择默认输出目录"}</button>}
         <div className="preference-list">
@@ -791,6 +863,22 @@ export default function App() {
           <div><span>4</span><p><strong>开始压缩</strong><small>任务启动时检查输出目录与可用空间，输出重名时自动编号。</small></p></div>
         </div>
         <div className="help-note"><ShieldCheck size={17} /><span>选择“原视频参数”时，会针对队列中的每个视频分别继承其色深和色度采样。</span></div>
+      </Modal>}
+
+      {sequenceImportOpen && <Modal title="添加序列帧媒体" onClose={() => setSequenceImportOpen(false)} footer={<button className="secondary-button" onClick={() => setSequenceImportOpen(false)}>取消</button>}>
+        <div className="sequence-source-options">
+          <button onClick={() => importSequence(pickSequenceFrame)}><Images size={25} /><span><strong>选择序列中的一帧</strong><small>自动识别同文件夹内、命名规则相同的全部帧</small></span><ChevronRight size={18} /></button>
+          <button onClick={() => importSequence(pickSequenceFolder)}><FolderOpen size={25} /><span><strong>选择文件夹</strong><small>扫描文件夹并载入其中识别到的全部序列</small></span><ChevronRight size={18} /></button>
+        </div>
+      </Modal>}
+
+      {sequenceDraft && <Modal title="序列设置" onClose={() => setSequenceDraft(undefined)} footer={<><button className="secondary-button" onClick={() => setSequenceDraft(undefined)}>取消</button><button className="primary-button" onClick={saveSequenceDraft}>应用</button></>}>
+        <div className="sequence-summary"><Images size={22} /><span><strong>{sequenceDraft.fileName}</strong><small>{sequenceDraft.sequencePattern} · {sequenceDraft.sequenceFrameCount} 帧</small></span></div>
+        <div className="modal-grid two-columns">
+          <Setting label="帧率"><input type="number" min={0.001} step={0.001} value={sequenceDraft.sequenceFps} onChange={(event) => setSequenceDraft((draft) => draft ? { ...draft, sequenceFps: Number(event.target.value) } : draft)} /></Setting>
+          <Setting label="像素尺寸（宽幅放大率）"><input type="number" min={0.001} step={0.01} value={sequenceDraft.sequencePixelAspect} onChange={(event) => setSequenceDraft((draft) => draft ? { ...draft, sequencePixelAspect: Number(event.target.value) } : draft)} /></Setting>
+        </div>
+        <div className="modal-section"><h3>分辨率</h3><div className="dimension-grid modal-dimensions"><Setting label="宽"><input type="number" min={2} value={sequenceDraft.width} onChange={(event) => setSequenceDraft((draft) => draft ? { ...draft, width: Number(event.target.value) } : draft)} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={sequenceDraft.height} onChange={(event) => setSequenceDraft((draft) => draft ? { ...draft, height: Number(event.target.value) } : draft)} /></Setting></div></div>
       </Modal>}
 
       {notice && <div className="toast" role="status">{notice}</div>}
@@ -825,10 +913,12 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
       <Setting label="格式"><select value={draft.codec} onChange={(event) => onChange(codecPatch(event.target.value as Codec))}>{Object.entries(codecLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
       <Setting label="色深"><select value={draft.bitDepth} onChange={(event) => onChange({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">原视频参数</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Setting>
       <Setting label="色度采样"><select value={draft.chroma} onChange={(event) => onChange({ chroma: event.target.value as Preset["chroma"] })}><option value="source">原视频参数</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Setting>
-      <Setting label="分辨率"><select value={resolutionValue(draft)} onChange={(event) => applyResolution(event.target.value, onChange)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="50">缩放 50%</option></select></Setting>
+      <Setting label="分辨率"><select value={resolutionValue(draft)} onChange={(event) => applyResolution(event.target.value, onChange)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="scale">缩放至倍率</option><option value="custom">自定义</option></select></Setting>
       <Setting label="码率模式"><select value={draft.bitrateMode} onChange={(event) => onChange({ bitrateMode: event.target.value as Preset["bitrateMode"] })}><option value="source_multiplier">按源视频比例</option><option value="target_mbps">指定码率</option></select></Setting>
-      <Setting label={draft.bitrateMode === "target_mbps" ? "目标码率 Mbps" : "源码率比例 %"}><input type="number" min={1} max={draft.bitrateMode === "target_mbps" ? 500 : 100} value={draft.bitrateMode === "target_mbps" ? draft.targetBitrateMbps : Math.round(draft.bitrateMultiplier * 100)} onChange={(event) => draft.bitrateMode === "target_mbps" ? onChange({ targetBitrateMbps: Number(event.target.value) }) : onChange({ bitrateMultiplier: Number(event.target.value) / 100 })} /></Setting>
+      <Setting label={draft.bitrateMode === "target_mbps" ? "目标码率 Mbps" : "源码率比例 %"}><input type="number" step={draft.bitrateMode === "target_mbps" ? .01 : .1} value={draft.bitrateMode === "target_mbps" ? draft.targetBitrateMbps : Number((draft.bitrateMultiplier * 100).toFixed(2))} onChange={(event) => draft.bitrateMode === "target_mbps" ? onChange({ targetBitrateMbps: Number(event.target.value) }) : onChange({ bitrateMultiplier: Number(event.target.value) / 100 })} /></Setting>
     </div></div>
+    {draft.resolutionMode === "scale_percent" && <label className="range-setting"><span>缩放倍率 <strong>{draft.scalePercent}%</strong></span><input type="range" min={10} max={90} value={draft.scalePercent} onChange={(event) => onChange({ scalePercent: Number(event.target.value) })} /></label>}
+    {draft.resolutionMode === "custom" && <div className="dimension-grid modal-dimensions"><Setting label="宽"><input type="number" min={2} value={draft.customWidth} onChange={(event) => onChange({ customWidth: Number(event.target.value) })} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={draft.customHeight} onChange={(event) => onChange({ customHeight: Number(event.target.value) })} /></Setting></div>}
     <div className="modal-section"><h3>色彩与编码</h3><div className="modal-grid three-columns">
       <Setting label="硬件"><select value={draft.hardware} onChange={(event) => onChange({ hardware: event.target.value as Hardware })}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
       <Setting label="色彩空间"><select value={draft.colorSpace} onChange={(event) => onChange({ colorSpace: event.target.value as Preset["colorSpace"] })}><option value="source">跟随源文件</option><option value="rec709">Rec.709</option><option value="rec2020">Rec.2020</option></select></Setting>
@@ -836,6 +926,7 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
     </div></div>
     <div className="modal-section"><h3>输出与后处理</h3><div className="modal-grid two-columns">
       <Setting label="输出策略"><select value={draft.outputMode} onChange={(event) => onChange({ outputMode: event.target.value as Preset["outputMode"] })}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
+      <Setting label="封装格式"><select value={draft.outputContainer} onChange={(event) => onChange({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A</option></select></Setting>
       <Setting label="命名"><select value={draft.namingMode} onChange={(event) => onChange({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
     </div>
     {draft.outputMode === "single_folder" && <button className="secondary-button full" onClick={onChooseOutput}><FolderOpen size={15} />{draft.outputDir ? shortPath(draft.outputDir) : "选择输出目录"}</button>}
@@ -892,7 +983,7 @@ function presetForItem(item: QueueItem, presets: Preset[], fallback?: Preset) {
 }
 
 function codecPatch(codec: Codec): Partial<Preset> {
-  if (codec === "prores") return { codec, bitDepth: 10, chroma: "422", hardware: "cpu" };
+  if (codec === "prores") return { codec, bitDepth: 10, chroma: "422", hardware: "cpu", outputContainer: "mov" };
   return { codec };
 }
 
@@ -930,18 +1021,21 @@ function estimateOutputBytes(item: QueueItem, preset?: Preset) {
 function targetResolution(item: QueueItem, preset?: Preset) {
   if (!preset || preset.resolutionMode === "source") return `${item.width}×${item.height}`;
   if (preset.resolutionMode === "scale_percent") return `原尺寸 ${preset.scalePercent}%`;
+  if (preset.resolutionMode === "custom") return `${preset.customWidth}×${preset.customHeight}`;
   return `短边 ${preset.shortEdge}p`;
 }
 
 function resolutionValue(preset?: Preset) {
   if (!preset || preset.resolutionMode === "source") return "source";
   if (preset.resolutionMode === "short_edge") return String(preset.shortEdge);
-  return String(preset.scalePercent);
+  if (preset.resolutionMode === "custom") return "custom";
+  return "scale";
 }
 
 function applyResolution(value: string, update: (patch: Partial<Preset>) => void) {
   if (value === "source") update({ resolutionMode: "source" });
-  else if (value === "50") update({ resolutionMode: "scale_percent", scalePercent: 50 });
+  else if (value === "scale") update({ resolutionMode: "scale_percent" });
+  else if (value === "custom") update({ resolutionMode: "custom" });
   else update({ resolutionMode: "short_edge", shortEdge: Number(value) });
 }
 
@@ -969,9 +1063,16 @@ function previewOutput(item: QueueItem, preset: Preset) {
   const directory = slash >= 0 ? item.source.slice(0, slash) : ".";
   const fileName = slash >= 0 ? item.source.slice(slash + 1) : item.source;
   const dot = fileName.lastIndexOf(".");
-  const stem = dot > -1 ? fileName.slice(0, dot) : fileName;
+  const rawStem = dot > -1 ? fileName.slice(0, dot) : fileName;
+  const patternStem = item.sequencePattern.replace(/\.[^.]+$/, "").replace(/%0?\d*d/i, "");
+  const stem = item.mediaKind === "sequence"
+    ? (patternStem || rawStem.replace(/[\d_.\- ]+$/, "") || rawStem).replace(/[_\-. ]+$/, "")
+    : rawStem;
   const name = preset.namingMode === "original" ? stem : `${preset.prefix}${stem}${preset.suffix}`;
-  const extension = preset.codec === "prores" ? ".mov" : ".mp4";
+  const sourceExtension = dot > -1 ? fileName.slice(dot).toLowerCase() : "";
+  const extension = preset.outputContainer === "source"
+    ? item.mediaKind === "sequence" ? ".mp4" : sourceExtension || (preset.codec === "prores" ? ".mov" : ".mp4")
+    : `.${preset.outputContainer}`;
   const outputDirectory = preset.outputMode === "single_folder" && preset.outputDir
     ? preset.outputDir
     : preset.outputMode === "in_place"

@@ -13,7 +13,8 @@ export const defaultPreferences: AppPreferences = {
   defaultOutputDir: "",
   keepTimesByDefault: true,
   confirmBeforeClear: true,
-  autoOpenDetails: true
+  autoOpenDetails: true,
+  defaultSequenceFps: 30
 };
 
 export async function getPlatformInfo(): Promise<PlatformInfo> {
@@ -83,6 +84,26 @@ export async function pickVideoFiles(): Promise<string[]> {
   return Array.isArray(result) ? result : [result];
 }
 
+export async function pickSequenceFrame(): Promise<string[]> {
+  if (!isTauriRuntime) return [];
+  const result = await open({
+    multiple: false,
+    directory: false,
+    filters: [{
+      name: "序列帧",
+      extensions: ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "exr", "dpx", "tga"]
+    }]
+  });
+  if (!result) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
+export async function pickSequenceFolder(): Promise<string[]> {
+  if (!isTauriRuntime) return [];
+  const result = await open({ multiple: false, directory: true });
+  return result && !Array.isArray(result) ? [result] : [];
+}
+
 export async function pickFolder(): Promise<string[]> {
   if (!isTauriRuntime) return [];
   const result = await open({ multiple: false, directory: true });
@@ -112,6 +133,11 @@ export async function probePaths(paths: string[], presetId: string): Promise<Que
   return invoke("probe_paths", { paths, presetId });
 }
 
+export async function probeSequencePaths(paths: string[], presetId: string, defaultFps: number): Promise<QueueItem[]> {
+  if (!isTauriRuntime) return [];
+  return invoke("probe_sequence_paths", { paths, presetId, defaultFps });
+}
+
 export async function startEncode(jobs: EncodeJob[]): Promise<string> {
   if (!isTauriRuntime) return `demo-session-${jobs.length}`;
   return invoke("start_encode", { jobs });
@@ -137,22 +163,26 @@ export async function onNativeDrop(handler: (paths: string[]) => void): Promise<
 
 export function normalizePreset(preset: Partial<Preset>): Preset {
   const bitDepth = preset.bitDepth === "source" ? "source" : Number(preset.bitDepth ?? 0);
+  const isLegacyProResDefault = preset.id === "prores-422-hq";
   return {
     id: preset.id ?? crypto.randomUUID(),
-    name: preset.name ?? "H.265 10bit HDR",
+    name: isLegacyProResDefault ? "ProRes 422 LT" : preset.name ?? "H.265 10bit HDR",
     codec: preset.codec ?? "h265",
     resolutionMode: preset.resolutionMode ?? "source",
     shortEdge: preset.shortEdge ?? 1080,
     scalePercent: preset.scalePercent ?? 50,
+    customWidth: preset.customWidth ?? 1920,
+    customHeight: preset.customHeight ?? 1080,
     bitrateMode: preset.bitrateMode ?? "source_multiplier",
     bitrateMultiplier: preset.bitrateMultiplier ?? 0.3,
     targetBitrateMbps: preset.targetBitrateMbps ?? 20,
     hardware: preset.hardware ?? "auto",
     outputMode: preset.outputMode ?? "subfolder",
     outputDir: preset.outputDir ?? "",
+    outputContainer: preset.outputContainer ?? (preset.codec === "prores" ? "mov" : "source"),
     namingMode: preset.namingMode ?? "suffix_prefix",
     prefix: preset.prefix ?? "",
-    suffix: preset.suffix ?? "_compressed",
+    suffix: isLegacyProResDefault && preset.suffix === "_prores422" ? "_prores422lt" : preset.suffix ?? "_compressed",
     keepTimes: preset.keepTimes ?? true,
     keepPanorama: preset.keepPanorama ?? true,
     colorSpace: preset.colorSpace ?? "source",
@@ -210,13 +240,14 @@ function demoPresets(): Preset[] {
       suffix: "_av1_1080p"
     }),
     normalizePreset({
-      id: "prores-422-hq",
-      name: "ProRes 422 HQ",
+      id: "prores-422-lt",
+      name: "ProRes 422 LT",
       codec: "prores",
       chroma: "422",
       bitrateMode: "source_multiplier",
       bitrateMultiplier: 1,
-      suffix: "_prores422"
+      outputContainer: "mov",
+      suffix: "_prores422lt"
     }),
     normalizePreset({ id: "h265-hlg-10bit", name: "H.265 HLG 10bit", codec: "h265", colorSpace: "rec2020", hdrMode: "hlg", hardware: "cpu", suffix: "_hlg" }),
     normalizePreset({ id: "h265-hdr10-10bit", name: "H.265 HDR10 10bit", codec: "h265", colorSpace: "rec2020", hdrMode: "hdr10", hardware: "cpu", suffix: "_hdr10" }),
@@ -248,6 +279,12 @@ function demoQueue(presetId: string): QueueItem[] {
     audioTracks: index === 2 ? 2 : 1,
     subtitleTracks: index === 1 ? 1 : 0,
     panoramaTagged: row.isPanorama && index === 2,
+    mediaKind: "video",
+    sequencePattern: "",
+    sequenceStartNumber: 0,
+    sequenceFrameCount: 0,
+    sequenceFps: 30,
+    sequencePixelAspect: 1,
     ...row
   }));
 }

@@ -2,7 +2,8 @@ export type Codec = "h265" | "h264" | "av1" | "prores";
 export type Hardware = "auto" | "cuda" | "metal" | "cpu";
 export type OutputMode = "single_folder" | "in_place" | "subfolder";
 export type NamingMode = "original" | "suffix_prefix";
-export type ResolutionMode = "source" | "short_edge" | "scale_percent";
+export type OutputContainer = "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a";
+export type ResolutionMode = "source" | "short_edge" | "scale_percent" | "custom";
 export type HdrMode = "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision";
 export type Chroma = "source" | "420" | "422";
 export type BitDepth = "source" | 8 | 10;
@@ -26,12 +27,15 @@ export interface Preset {
   resolutionMode: ResolutionMode;
   shortEdge: number;
   scalePercent: number;
+  customWidth: number;
+  customHeight: number;
   bitrateMode: "source_multiplier" | "target_mbps";
   bitrateMultiplier: number;
   targetBitrateMbps: number;
   hardware: Hardware;
   outputMode: OutputMode;
   outputDir: string;
+  outputContainer: OutputContainer;
   namingMode: NamingMode;
   prefix: string;
   suffix: string;
@@ -73,6 +77,12 @@ export interface QueueItem {
   output: string;
   status: string;
   progress: number;
+  mediaKind: "video" | "sequence";
+  sequencePattern: string;
+  sequenceStartNumber: number;
+  sequenceFrameCount: number;
+  sequenceFps: number;
+  sequencePixelAspect: number;
 }
 
 export interface EncodeJob {
@@ -96,4 +106,5 @@ export interface AppPreferences {
   keepTimesByDefault: boolean;
   confirmBeforeClear: boolean;
   autoOpenDetails: boolean;
+  defaultSequenceFps: number;
 }
