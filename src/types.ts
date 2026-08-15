@@ -7,6 +7,7 @@ export type ResolutionMode = "source" | "short_edge" | "scale_percent" | "custom
 export type HdrMode = "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision";
 export type Chroma = "source" | "420" | "422";
 export type BitDepth = "source" | 8 | 10;
+export type AlphaBackground = "checkerboard" | "black" | "white";
 
 export interface PlatformInfo {
   os: "windows" | "macos" | "linux" | "unknown";
@@ -41,6 +42,7 @@ export interface Preset {
   suffix: string;
   keepTimes: boolean;
   keepPanorama: boolean;
+  alphaBackground: AlphaBackground;
   colorSpace: "source" | "rec709" | "rec2020";
   hdrMode: HdrMode;
   bitDepth: BitDepth;
@@ -63,6 +65,7 @@ export interface QueueItem {
   duration: number;
   sizeBytes: number;
   thumbnail?: string;
+  hasAlpha: boolean;
   isPanorama: boolean;
   panoramaTagged: boolean;
   bitDepth: number;

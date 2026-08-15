@@ -185,6 +185,7 @@ export function normalizePreset(preset: Partial<Preset>): Preset {
     suffix: isLegacyProResDefault && preset.suffix === "_prores422" ? "_prores422lt" : preset.suffix ?? "_compressed",
     keepTimes: preset.keepTimes ?? true,
     keepPanorama: preset.keepPanorama ?? true,
+    alphaBackground: preset.alphaBackground === "black" || preset.alphaBackground === "white" ? preset.alphaBackground : "checkerboard",
     colorSpace: preset.colorSpace ?? "source",
     hdrMode: preset.hdrMode ?? "source",
     bitDepth: bitDepth === 8 || bitDepth === 10 ? bitDepth : "source",
@@ -285,6 +286,7 @@ function demoQueue(presetId: string): QueueItem[] {
     sequenceFrameCount: 0,
     sequenceFps: 30,
     sequencePixelAspect: 1,
+    hasAlpha: false,
     ...row
   }));
 }

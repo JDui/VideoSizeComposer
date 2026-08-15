@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import packageMetadata from "../package.json";
 import {
   Check,
   CheckCircle2,
@@ -53,7 +54,7 @@ import {
   savePreferences,
   startEncode
 } from "./tauri";
-import type { AppPreferences, Codec, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
+import type { AlphaBackground, AppPreferences, Codec, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
 
 const defaultPlatform: PlatformInfo = { os: "unknown", accelerators: ["auto", "cpu"] };
 const defaultToolStatus: ToolStatus = { ffmpeg: "检测中", ffprobe: "检测中", encoders: [], ok: false };
@@ -70,6 +71,18 @@ const presetDescriptions: Record<Codec, string> = {
   h264: "平衡画质与体积，广泛兼容",
   av1: "开源格式，体积更小",
   prores: "高画质，适合后期编辑"
+};
+
+const packageVersion = typeof packageMetadata.version === "string" && packageMetadata.version.trim()
+  ? packageMetadata.version
+  : "unknown";
+const functionVersion = deriveFunctionVersion(packageVersion);
+
+type ContextMenuState = {
+  kind: "preset" | "media";
+  id: string;
+  left: number;
+  top: number;
 };
 
 export default function App() {
@@ -96,6 +109,7 @@ export default function App() {
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [sequenceImportOpen, setSequenceImportOpen] = useState(false);
   const [sequenceDraft, setSequenceDraft] = useState<QueueItem>();
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>();
   const [qualityEditing, setQualityEditing] = useState(false);
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
   const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(loadPreferences);
@@ -226,6 +240,28 @@ export default function App() {
     const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [isEncoding]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest(".context-menu")) setContextMenu(undefined);
+    };
+    const closeOnKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setContextMenu(undefined);
+    };
+    const closeOnViewportChange = () => setContextMenu(undefined);
+    window.addEventListener("pointerdown", closeOnPointerDown);
+    window.addEventListener("keydown", closeOnKeyDown);
+    window.addEventListener("resize", closeOnViewportChange);
+    window.addEventListener("scroll", closeOnViewportChange, true);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnPointerDown);
+      window.removeEventListener("keydown", closeOnKeyDown);
+      window.removeEventListener("resize", closeOnViewportChange);
+      window.removeEventListener("scroll", closeOnViewportChange, true);
+    };
+  }, [contextMenu]);
 
   useEffect(() => () => {
     if (simulationTimer.current !== null) window.clearInterval(simulationTimer.current);
@@ -370,6 +406,57 @@ export default function App() {
     setPresets(saved.map(normalizePreset));
     if (activePresetId === preset.id) setActivePresetId("");
     setNotice("预设已删除");
+  }
+
+  function openContextMenu(kind: ContextMenuState["kind"], id: string, event: React.MouseEvent<HTMLElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (kind === "media") {
+      const item = queue.find((entry) => entry.id === id);
+      if (item && !item.selected) {
+        setQueue((items) => items.map((entry) => ({ ...entry, selected: entry.id === id })));
+        selectionAnchorId.current = id;
+      }
+    }
+    const width = 208;
+    const height = kind === "preset" ? 184 : 148;
+    setContextMenu({
+      kind,
+      id,
+      left: Math.min(Math.max(8, event.clientX), Math.max(8, window.innerWidth - width - 8)),
+      top: Math.min(Math.max(8, event.clientY), Math.max(8, window.innerHeight - height - 8))
+    });
+  }
+
+  function copyPreset(preset: Preset) {
+    setContextMenu(undefined);
+    setPresetDraft(normalizePreset({ ...preset, id: crypto.randomUUID(), name: `${preset.name} 副本` }));
+    setPresetEditorOpen(true);
+    setNotice("已创建预设副本，请保存");
+  }
+
+  function isItemEncoding(item: QueueItem) {
+    return encodingIds.includes(item.id) || item.status.includes("编码") || item.status.includes("排队");
+  }
+
+  function resetQueueItem(item: QueueItem) {
+    if (isItemEncoding(item)) return;
+    const preset = presetForItem(item, presets, activePreset);
+    setQueue((items) => items.map((entry) => entry.id === item.id
+      ? { ...entry, status: "就绪", progress: 0, output: preset ? previewOutput(entry, preset) : entry.output }
+      : entry));
+    setContextMenu(undefined);
+    setNotice("已重置媒体状态");
+  }
+
+  function deleteQueueItem(item: QueueItem) {
+    if (isItemEncoding(item)) return;
+    setQueue((items) => items.filter((entry) => entry.id !== item.id));
+    setActiveJobIds((ids) => ids.filter((id) => id !== item.id));
+    setDetailItemId((id) => id === item.id ? "" : id);
+    if (detailItemId === item.id) setDetailsOpen(false);
+    setContextMenu(undefined);
+    setNotice(`已删除 ${item.fileName}`);
   }
 
   async function chooseOutputFolder() {
@@ -620,7 +707,7 @@ export default function App() {
       <header className="titlebar">
         <div className="brand-lockup">
           <span className="brand-mark"><Play size={25} /></span>
-          <strong>VideoSize Composer</strong>
+          <strong>VideoSize Composer <span className="brand-version">{functionVersion}</span></strong>
         </div>
         <div className="titlebar-actions">
           <button className="text-icon-button" onClick={() => { setPreferencesDraft(preferences); setSettingsOpen(true); }}><Settings size={17} />设置</button>
@@ -640,7 +727,7 @@ export default function App() {
             <button className="preset-section-title" aria-expanded={presetListOpen} onClick={() => setPresetListOpen((open) => !open)}><span>我的预设 <small>{filteredPresets.length}</small></span><ChevronDown size={15} className={presetListOpen ? "rotated" : ""} /></button>
             {presetListOpen && <div className="preset-list">
               {filteredPresets.map((preset) => (
-                <div key={preset.id} className={`preset-item ${preset.id === activePresetId ? "is-active" : ""}`}>
+                <div key={preset.id} className={`preset-item ${preset.id === activePresetId ? "is-active" : ""}`} onContextMenu={(event) => openContextMenu("preset", preset.id, event)}>
                   <button className="preset-apply" onClick={() => choosePreset(preset.id)}>
                     <span className="preset-icon"><Film size={15} /></span>
                     <span className="preset-copy"><strong>{preset.name}</strong><small>{presetDescriptions[preset.codec]}</small></span>
@@ -698,7 +785,6 @@ export default function App() {
               </div>
               <SearchField value={filter} onChange={setFilter} placeholder="搜索文件" compact />
               <div className="queue-summary">共 {queue.length} 个文件 · {formatBytes(queue.reduce((sum, item) => sum + item.sizeBytes, 0))}</div>
-              <label className="timestamp-toggle" title="输出文件会恢复源视频的创建日期和修改时间"><span>保留创建与修改时间</span><input type="checkbox" checked={activePreset?.keepTimes ?? true} onChange={(event) => updateActivePreset({ keepTimes: event.target.checked })} /><span className="toggle-track"><span /></span></label>
             </header>
 
             <div className="queue-head" aria-hidden="true"><span /><span>文件名</span><span>源文件信息</span><span>预计输出</span><span>状态</span><span /></div>
@@ -721,10 +807,11 @@ export default function App() {
                     key={item.id}
                     data-item-id={item.id}
                     onClick={(event) => handleRowClick(event, item.id)}
+                    onContextMenu={(event) => openContextMenu("media", item.id, event)}
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
                     <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : <Film size={19} />}</span>}<span><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}</span></div>
-                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.isPanorama && <em>{item.panoramaTagged ? "360° 已识别" : "360° 画幅候选"}</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}</span></div>
+                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.isPanorama && <em>{item.panoramaTagged ? "360° 已识别" : "360° 画幅候选"}</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}</span></div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
                     <StatusCell item={item} />
                     <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); setDetailItemId(item.id); setDetailsOpen(true); }}><ChevronRight size={19} /></button>
@@ -793,8 +880,10 @@ export default function App() {
             {activePreset?.hdrMode === "dolby_vision" && <div className="source-color-note"><ShieldCheck size={15} />杜比视界模式无损复制 HEVC 视频流，保留源 RPU；不可同时缩放或套 LUT。</div>}
           </div>}
 
-          <button className="postprocess-card" onClick={() => setPostprocessOpen((open) => !open)}><span><strong>后处理</strong><small>{activePreset?.lutEnabled ? `${shortPath(activePreset.lutName)} · ${activePreset.lutIntensity}%` : "LUT / 全景元数据"}</small></span><SlidersHorizontal size={17} /><ChevronDown size={17} className={postprocessOpen ? "rotated" : ""} /></button>
+          <button className="postprocess-card" onClick={() => setPostprocessOpen((open) => !open)}><span><strong>后处理</strong><small>{activePreset?.lutEnabled ? `${shortPath(activePreset.lutName)} · ${activePreset.lutIntensity}%` : "LUT / 全景元数据"} · Alpha 背景：{alphaBackgroundLabel(activePreset?.alphaBackground)}</small></span><SlidersHorizontal size={17} /><ChevronDown size={17} className={postprocessOpen ? "rotated" : ""} /></button>
           {postprocessOpen && <div className="postprocess-settings">
+            <Setting label="Alpha 背景"><select value={activePreset?.alphaBackground ?? "checkerboard"} onChange={(event) => updateActivePreset({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Setting>
+            <small className="field-note">仅含 Alpha 通道的视频会将所选背景实际合成到输出。</small>
             <label className="inline-check"><input type="checkbox" checked={activePreset?.lutEnabled ?? false} onChange={(event) => updateActivePreset({ lutEnabled: event.target.checked })} /><span>启用 LUT</span></label>
             <button className="secondary-button full" onClick={chooseLut}><FilePlus2 size={15} />{activePreset?.lutName ? shortPath(activePreset.lutName) : "选择 .cube / .3dl / .lut"}</button>
             <label className="range-setting"><span>LUT 强度 <strong>{activePreset?.lutIntensity ?? 80}%</strong></span><input type="range" min={0} max={100} value={activePreset?.lutIntensity ?? 80} onChange={(event) => updateActivePreset({ lutIntensity: Number(event.target.value) })} /></label>
@@ -839,6 +928,37 @@ export default function App() {
         onSave={persistPresetDraft}
       />}
 
+      {contextMenu && (
+        <div
+          className="context-menu"
+          role="menu"
+          aria-label={contextMenu.kind === "preset" ? "预设操作" : "媒体操作"}
+          style={{ left: contextMenu.left, top: contextMenu.top }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {contextMenu.kind === "preset" ? (() => {
+            const preset = presets.find((entry) => entry.id === contextMenu.id);
+            if (!preset) return null;
+            return <>
+              <button role="menuitem" onClick={() => { choosePreset(preset.id); setContextMenu(undefined); }}>应用</button>
+              <button role="menuitem" onClick={() => { editPreset(preset); setContextMenu(undefined); }}>编辑</button>
+              <button role="menuitem" onClick={() => copyPreset(preset)}>复制</button>
+              <button role="menuitem" className="danger" onClick={() => { setContextMenu(undefined); deleteSavedPreset(preset); }}>删除</button>
+            </>;
+          })() : (() => {
+            const item = queue.find((entry) => entry.id === contextMenu.id);
+            if (!item) return null;
+            const disabled = isItemEncoding(item);
+            return <>
+              <button role="menuitem" onClick={() => { setDetailItemId(item.id); setDetailsOpen(true); setContextMenu(undefined); }}>查看源信息</button>
+              <button role="menuitem" disabled={disabled} onClick={() => resetQueueItem(item)}>重置状态</button>
+              <button role="menuitem" className="danger" disabled={disabled} onClick={() => deleteQueueItem(item)}>删除</button>
+            </>;
+          })()}
+        </div>
+      )}
+
       {settingsOpen && <Modal title="应用设置" onClose={() => setSettingsOpen(false)} footer={<><button className="secondary-button" onClick={() => setPreferencesDraft(defaultPreferences)}>恢复默认</button><button className="primary-button" onClick={commitPreferences}>保存设置</button></>}>
         <div className="modal-grid two-columns">
           <Setting label="默认编码设备"><select value={preferencesDraft.defaultHardware} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: event.target.value as Hardware }))}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
@@ -851,6 +971,7 @@ export default function App() {
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.confirmBeforeClear} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, confirmBeforeClear: event.target.checked }))} /><span>清空媒体列表前要求确认</span></label>
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.autoOpenDetails} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, autoOpenDetails: event.target.checked }))} /><span>开始编码时自动展开任务详情</span></label>
         </div>
+        <div className="version-card" aria-label={`软件版本 ${packageVersion}`}><span><strong>软件版本</strong><small>功能版本 {functionVersion}</small></span><code>{packageVersion}</code></div>
         <div className="environment-card"><strong>编码环境</strong><span>{toolStatus.ok ? "FFmpeg 与 FFprobe 可用" : "编码工具不可用"}</span><small>{toolStatus.ffmpeg}</small></div>
         <button className="secondary-button full" onClick={applyPreferenceDefaults}>将这些默认值应用到当前任务</button>
       </Modal>}
@@ -928,6 +1049,7 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
       <Setting label="输出策略"><select value={draft.outputMode} onChange={(event) => onChange({ outputMode: event.target.value as Preset["outputMode"] })}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
       <Setting label="封装格式"><select value={draft.outputContainer} onChange={(event) => onChange({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A</option></select></Setting>
       <Setting label="命名"><select value={draft.namingMode} onChange={(event) => onChange({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
+      <Setting label="Alpha 背景"><select value={draft.alphaBackground} onChange={(event) => onChange({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Setting>
     </div>
     {draft.outputMode === "single_folder" && <button className="secondary-button full" onClick={onChooseOutput}><FolderOpen size={15} />{draft.outputDir ? shortPath(draft.outputDir) : "选择输出目录"}</button>}
     {draft.namingMode === "suffix_prefix" && <div className="modal-grid two-columns"><Setting label="前缀"><input value={draft.prefix} onChange={(event) => onChange({ prefix: event.target.value })} /></Setting><Setting label="后缀"><input value={draft.suffix} onChange={(event) => onChange({ suffix: event.target.value })} /></Setting></div>}
@@ -1000,7 +1122,7 @@ function hdrPatch(hdrMode: Preset["hdrMode"], preset?: Preset): Partial<Preset> 
 function mediaDetail(item?: QueueItem) {
   if (!item) return "媒体信息不可用";
   const tracks = `${item.audioTracks} 音轨${item.subtitleTracks ? ` · ${item.subtitleTracks} 字幕` : ""}`;
-  return `${item.width}×${item.height} · ${item.fps} · ${item.bitDepth}-bit · 4:2:${item.chroma.slice(-1)} · ${hdrLabel(item.hdrMode)} · ${tracks}`;
+  return `${item.width}×${item.height} · ${item.fps} · ${item.bitDepth}-bit · 4:2:${item.chroma.slice(-1)} · ${hdrLabel(item.hdrMode)}${item.hasAlpha ? " · Alpha" : ""} · ${tracks}`;
 }
 
 function estimateOutputBytes(item: QueueItem, preset?: Preset) {
@@ -1056,6 +1178,19 @@ function hdrLabel(mode: QueueItem["hdrMode"]) {
   if (mode === "hdr10") return "HDR10";
   if (mode === "hlg") return "HLG";
   return "SDR";
+}
+
+function alphaBackgroundLabel(background?: AlphaBackground) {
+  if (background === "black") return "黑底";
+  if (background === "white") return "白底";
+  return "棋盘格";
+}
+
+function deriveFunctionVersion(version: string) {
+  const [year, feature] = version.split(".");
+  return /^\d{4}$/.test(year ?? "") && /^\d+$/.test(feature ?? "")
+    ? `${year}.${feature}`
+    : "unknown";
 }
 
 function previewOutput(item: QueueItem, preset: Preset) {

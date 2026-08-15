@@ -1,6 +1,6 @@
 [package]
 name = "videosize-composer"
-version = "0.1.0-alpha.3"
+version = "2026.1.3"
 description = "Cross-platform video compression tool"
 authors = ["VideoSize Composer"]
 edition = "2021"

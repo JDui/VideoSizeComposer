@@ -73,6 +73,8 @@ struct Preset {
     suffix: String,
     keep_times: bool,
     keep_panorama: bool,
+    #[serde(default = "default_alpha_background")]
+    alpha_background: String,
     #[serde(default = "default_color_space")]
     color_space: String,
     #[serde(default = "default_hdr_mode")]
@@ -109,6 +111,8 @@ struct QueueItem {
     size_bytes: u64,
     #[serde(default, skip_deserializing)]
     thumbnail: String,
+    #[serde(default)]
+    has_alpha: bool,
     is_panorama: bool,
     #[serde(default)]
     panorama_tagged: bool,
@@ -715,6 +719,12 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
         return Err(format!("不支持的色度采样：{}", preset.chroma));
     }
     if !matches!(
+        preset.alpha_background.as_str(),
+        "checkerboard" | "black" | "white"
+    ) {
+        return Err(format!("不支持的 Alpha 背景：{}", preset.alpha_background));
+    }
+    if !matches!(
         preset.output_container.as_str(),
         "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a"
     ) {
@@ -762,6 +772,9 @@ fn validate_job(job: &EncodeJob) -> Result<(), String> {
         ));
     }
     if job.preset.hdr_mode == "dolby_vision" {
+        if job.item.has_alpha {
+            return Err("含 Alpha 通道的媒体不能使用杜比视界保留导出；请改用普通 H.265 输出并选择 Alpha 背景".into());
+        }
         if job.item.hdr_mode != "dolby_vision" {
             return Err(format!(
                 "{} 不是 Dolby Vision 源视频，无法执行杜比视界保留导出",
@@ -916,6 +929,7 @@ fn preset_with_defaults(id: &str, name: &str, codec: &str, suffix: &str) -> Pres
         suffix: suffix.into(),
         keep_times: true,
         keep_panorama: true,
+        alpha_background: default_alpha_background(),
         color_space: default_color_space(),
         hdr_mode: default_hdr_mode(),
         bit_depth: default_preset_bit_depth(),
@@ -965,6 +979,10 @@ fn default_color_space() -> String {
 
 fn default_hdr_mode() -> String {
     "source".into()
+}
+
+fn default_alpha_background() -> String {
+    "checkerboard".into()
 }
 
 fn default_preset_bit_depth() -> String {
@@ -1153,6 +1171,7 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         duration,
         size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
         thumbnail: generate_thumbnail(path, duration),
+        has_alpha: detect_alpha_pixel_format(pixel_format),
         is_panorama: detect_panorama(&json),
         panorama_tagged: detect_panorama_tagged(&json),
         bit_depth: detect_bit_depth(&video, pixel_format),
@@ -1571,7 +1590,7 @@ fn build_ffmpeg_args_with_sequence(
     sequence_list: Option<&Path>,
 ) -> Vec<String> {
     let encoder = video_encoder(item, preset);
-    let dolby_vision_copy = preset.hdr_mode == "dolby_vision";
+    let dolby_vision_copy = preset.hdr_mode == "dolby_vision" && !item.has_alpha;
     let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
@@ -1720,6 +1739,9 @@ fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
         }
         _ => {}
     }
+    if item.has_alpha {
+        filters.push(alpha_background_filter(&preset.alpha_background));
+    }
     if let Some(color_filter) = color_conversion_filter(item, preset) {
         filters.push(color_filter);
     }
@@ -1743,6 +1765,23 @@ fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
     } else {
         Some(filters.join(","))
     }
+}
+
+fn alpha_background_filter(background: &str) -> String {
+    let background_expression = match background {
+        "black" => "0".to_string(),
+        "white" => "255".to_string(),
+        _ => "if(gt(mod(floor(X/32)+floor(Y/32),2),0),192,96)".to_string(),
+    };
+    let composite = |channel: &str| {
+        format!("{channel}(X,Y)*alpha(X,Y)/255+({background_expression})*(1-alpha(X,Y)/255)")
+    };
+    format!(
+        "format=rgba,geq=r='{}':g='{}':b='{}':a='255'",
+        composite("r"),
+        composite("g"),
+        composite("b")
+    )
 }
 
 fn color_conversion_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
@@ -2382,6 +2421,19 @@ fn detect_chroma(pixel_format: &str) -> String {
     }
 }
 
+fn detect_alpha_pixel_format(pixel_format: &str) -> bool {
+    let value = pixel_format.to_ascii_lowercase();
+    value.starts_with("yuva")
+        || value.starts_with("ayuv")
+        || value.starts_with("gbrap")
+        || value.starts_with("ya")
+        || value.contains("rgba")
+        || value.contains("argb")
+        || value.contains("bgra")
+        || value.contains("abgr")
+        || value.contains("grayalpha")
+}
+
 fn parse_progress(line: &str, duration: f64) -> Option<u8> {
     if duration <= 0.0 {
         return None;
@@ -2573,6 +2625,7 @@ mod tests {
             duration: 10.0,
             size_bytes: 10,
             thumbnail: String::new(),
+            has_alpha: false,
             is_panorama: true,
             panorama_tagged: true,
             bit_depth: 8,
@@ -2612,10 +2665,16 @@ mod tests {
         let source_preset = preset_with_defaults("source", "跟随源视频", "h265", "_source");
         assert_eq!(source_preset.bit_depth, "source");
         assert_eq!(source_preset.chroma, "source");
+        assert_eq!(source_preset.alpha_background, "checkerboard");
         let mut legacy_json = serde_json::to_value(&source_preset).unwrap();
         legacy_json["bitDepth"] = Value::from(10);
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("alphaBackground");
         let migrated: Preset = serde_json::from_value(legacy_json).unwrap();
         assert_eq!(migrated.bit_depth, "10");
+        assert_eq!(migrated.alpha_background, "checkerboard");
         assert_eq!(pixel_format(&item, &source_preset), "yuv420p");
         let mut ten_bit_422_item = item.clone();
         ten_bit_422_item.bit_depth = 10;
@@ -2678,6 +2737,74 @@ mod tests {
         })
         .is_err());
         let _ = fs::remove_dir_all(lut_root);
+    }
+
+    #[test]
+    fn alpha_detection_and_background_filters_cover_common_formats() {
+        for pixel_format in [
+            "rgba",
+            "argb",
+            "bgra64le",
+            "abgr",
+            "yuva420p",
+            "yuva444p10le",
+            "gbrap12le",
+            "ya8",
+            "grayalpha",
+        ] {
+            assert!(detect_alpha_pixel_format(pixel_format), "{pixel_format}");
+        }
+        for pixel_format in ["yuv420p", "yuv422p10le", "gbrp", "gray"] {
+            assert!(!detect_alpha_pixel_format(pixel_format), "{pixel_format}");
+        }
+
+        let mut item = QueueItem {
+            id: "alpha-item".into(),
+            source: "input.png".into(),
+            file_name: "input.png".into(),
+            codec: "PNG".into(),
+            width: 320,
+            height: 180,
+            fps: "24 fps".into(),
+            bitrate: 1_000_000,
+            duration: 1.0,
+            size_bytes: 10,
+            thumbnail: String::new(),
+            has_alpha: true,
+            is_panorama: false,
+            panorama_tagged: false,
+            bit_depth: 8,
+            chroma: "420".into(),
+            color_space: "bt709".into(),
+            color_transfer: "bt709".into(),
+            hdr_mode: "sdr".into(),
+            audio_tracks: 0,
+            subtitle_tracks: 0,
+            preset_id: "alpha".into(),
+            selected: true,
+            output: String::new(),
+            status: "就绪".into(),
+            progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
+        };
+        let mut preset = preset_with_defaults("alpha", "Alpha", "h264", "_alpha");
+        for (background, expected) in [("checkerboard", "192"), ("black", "0"), ("white", "255")] {
+            preset.alpha_background = background.into();
+            let filter = video_filter(&item, &preset).unwrap();
+            assert!(filter.contains("format=rgba"));
+            assert!(filter.contains("alpha(X,Y)"));
+            assert!(filter.contains(expected), "{background}: {filter}");
+        }
+        item.has_alpha = false;
+        assert!(!video_filter(&item, &preset)
+            .unwrap_or_default()
+            .contains("alpha(X,Y)"));
     }
 
     #[test]
@@ -2939,6 +3066,7 @@ mod tests {
             sequence_frame_count: 0,
             sequence_fps: default_sequence_fps(),
             sequence_pixel_aspect: default_pixel_aspect(),
+            has_alpha: false,
             sequence_frames: Vec::new(),
         };
         let mut preset = preset_with_defaults("preset", "Preset", "h265", "_压缩");
@@ -3100,6 +3228,7 @@ mod tests {
             sequence_frame_count: 0,
             sequence_fps: default_sequence_fps(),
             sequence_pixel_aspect: default_pixel_aspect(),
+            has_alpha: false,
             sequence_frames: Vec::new(),
         };
         preflight_jobs(&[EncodeJob { item, preset }]).unwrap();
