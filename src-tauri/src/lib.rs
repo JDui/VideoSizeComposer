@@ -89,6 +89,10 @@ struct Preset {
     custom_width: u32,
     #[serde(default = "default_custom_height")]
     custom_height: u32,
+    #[serde(default = "default_fps_mode")]
+    fps_mode: String,
+    #[serde(default = "default_fps_value")]
+    fps_value: f64,
     bitrate_mode: String,
     bitrate_multiplier: f64,
     target_bitrate_mbps: f64,
@@ -939,6 +943,14 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
     if !matches!(preset.chroma.as_str(), "source" | "420" | "422") {
         return Err(format!("不支持的色度采样：{}", preset.chroma));
     }
+    if !matches!(preset.fps_mode.as_str(), "source" | "preset" | "custom") {
+        return Err(format!("不支持的帧率模式：{}", preset.fps_mode));
+    }
+    if matches!(preset.fps_mode.as_str(), "preset" | "custom")
+        && !(preset.fps_value.is_finite() && preset.fps_value > 0.0)
+    {
+        return Err("帧率模式需要有效的目标帧率".into());
+    }
     if !matches!(
         preset.alpha_background.as_str(),
         "checkerboard" | "black" | "white"
@@ -1183,6 +1195,8 @@ fn preset_with_defaults(id: &str, name: &str, codec: &str, suffix: &str) -> Pres
         scale_percent: default_scale_percent(),
         custom_width: default_custom_width(),
         custom_height: default_custom_height(),
+        fps_mode: default_fps_mode(),
+        fps_value: default_fps_value(),
         bitrate_mode: "source_multiplier".into(),
         bitrate_multiplier: 0.30,
         target_bitrate_mbps: 20.0,
@@ -1229,6 +1243,14 @@ fn default_custom_height() -> u32 {
 
 fn default_output_container() -> String {
     "source".into()
+}
+
+fn default_fps_mode() -> String {
+    "source".into()
+}
+
+fn default_fps_value() -> f64 {
+    30.0
 }
 
 fn default_media_kind() -> String {
@@ -2350,6 +2372,37 @@ fn output_extension(item: &QueueItem, preset: &Preset) -> String {
         .to_ascii_lowercase()
 }
 
+/// Target output frame rate when the preset asks for one. Dolby Vision stream
+/// copy cannot re-time frames, so it always stays on the source rate.
+fn output_fps(preset: &Preset) -> Option<f64> {
+    match preset.fps_mode.as_str() {
+        "preset" | "custom"
+            if preset.fps_value.is_finite()
+                && preset.fps_value > 0.0
+                && preset.hdr_mode != "dolby_vision" =>
+        {
+            Some(preset.fps_value)
+        }
+        _ => None,
+    }
+}
+
+fn fps_value_string(value: f64) -> String {
+    let value = value.max(0.001);
+    if (value.fract()).abs() < 0.001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+/// Append an output `-r` (target frame rate) flag before the output path.
+fn append_output_fps(args: &mut Vec<String>, preset: &Preset) {
+    if let Some(fps) = output_fps(preset) {
+        args.extend(["-r".into(), fps_value_string(fps)]);
+    }
+}
+
 fn build_alpha_output_path(main_output: &Path) -> PathBuf {
     let parent = main_output.parent().unwrap_or_else(|| Path::new("."));
     let stem = main_output
@@ -2567,6 +2620,7 @@ fn build_ffmpeg_args_with_sequence(
         };
         args.extend(["-movflags".into(), movflags.into()]);
     }
+    append_output_fps(&mut args, preset);
     args.push(output.to_string_lossy().to_string());
     args
 }
@@ -2728,6 +2782,7 @@ fn build_ffmpeg_args_with_audio(
     if matches!(extension.as_str(), "mp4" | "mov" | "m4v") {
         args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
     }
+    append_output_fps(&mut args, preset);
     args.push(output.to_string_lossy().to_string());
     args
 }
@@ -2823,6 +2878,7 @@ fn build_alpha_ffmpeg_args_with_sequence(
     ) {
         args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
     }
+    append_output_fps(&mut args, preset);
     args.push(output.to_string_lossy().to_string());
     args
 }
@@ -4110,6 +4166,101 @@ mod tests {
         })
         .is_err());
         let _ = fs::remove_dir_all(lut_root);
+    }
+
+    #[test]
+    fn build_args_honor_target_fps() {
+        let item = QueueItem {
+            id: "fps-item".into(),
+            source: "input.mp4".into(),
+            file_name: "input.mp4".into(),
+            codec: "H264".into(),
+            width: 1920,
+            height: 1080,
+            fps: "29.97 fps".into(),
+            bitrate: 20_000_000,
+            duration: 10.0,
+            size_bytes: 10,
+            thumbnail: String::new(),
+            has_alpha: false,
+            is_panorama: false,
+            panorama_tagged: false,
+            bit_depth: 8,
+            chroma: "420".into(),
+            color_space: "bt709".into(),
+            color_transfer: "bt709".into(),
+            hdr_mode: "sdr".into(),
+            audio_tracks: 0,
+            subtitle_tracks: 0,
+            preset_id: "preset".into(),
+            selected: true,
+            output: String::new(),
+            status: "等待中".into(),
+            progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
+        };
+
+        // 默认“保持原帧率”不输出 -r
+        let source_preset = preset_with_defaults("fps-source", "保持原帧率", "h264", "_fps");
+        assert_eq!(source_preset.fps_mode, "source");
+        let args = build_ffmpeg_args(&item, &source_preset, Path::new("out.mp4")).join(" ");
+        assert!(!args.contains(" -r "), "source fps must not add -r: {args}");
+
+        // 常见帧率选项写入 -r
+        let mut preset = preset_with_defaults("fps-preset", "常见帧率", "h264", "_fps");
+        preset.fps_mode = "preset".into();
+        preset.fps_value = 25.0;
+        assert!(validate_preset(&preset).is_ok());
+        let args = build_ffmpeg_args(&item, &preset, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-r 25"), "expected -r 25: {args}");
+
+        // 自定义帧率支持小数，如 29.97
+        let mut custom = preset.clone();
+        custom.fps_mode = "custom".into();
+        custom.fps_value = 29.97;
+        let args = build_ffmpeg_args(&item, &custom, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-r 29.970"), "expected -r 29.970: {args}");
+
+        // Alpha 遮罩路径同样应用目标帧率
+        let mut alpha_item = item.clone();
+        alpha_item.has_alpha = true;
+        let alpha_args = build_alpha_ffmpeg_args_with_sequence(
+            &alpha_item,
+            &custom,
+            Path::new("mask.mp4"),
+            None,
+        )
+        .join(" ");
+        assert!(alpha_args.contains("-r 29.970"), "alpha path: {alpha_args}");
+
+        // 杜比视界 stream copy 不能改帧率，即使设置了目标帧率也不写 -r
+        let mut dovi_item = item.clone();
+        dovi_item.hdr_mode = "dolby_vision".into();
+        let mut dovi = preset_with_defaults("fps-dovi", "杜比保留", "h265", "_dovi");
+        dovi.hdr_mode = "dolby_vision".into();
+        dovi.fps_mode = "preset".into();
+        dovi.fps_value = 24.0;
+        let args = build_ffmpeg_args(&dovi_item, &dovi, Path::new("dovi.mp4")).join(" ");
+        assert!(args.contains("-c:v copy"));
+        assert!(!args.contains(" -r "), "dolby vision must not add -r: {args}");
+
+        // 校验：未知帧率模式或非正数目标帧率会被拒绝
+        let mut invalid = preset.clone();
+        invalid.fps_mode = "telecine".into();
+        assert!(validate_preset(&invalid).is_err());
+        invalid.fps_mode = "custom".into();
+        invalid.fps_value = 0.0;
+        assert!(validate_preset(&invalid).is_err());
     }
 
     #[test]

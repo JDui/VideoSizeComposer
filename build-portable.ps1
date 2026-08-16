@@ -15,6 +15,10 @@ $codexPnpmCandidates = @(
 $codexPnpm = $codexPnpmCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($codexPnpm) {
   $pnpm = $codexPnpm
+  # Tauri's beforeBuildCommand runs `pnpm build` in a child process.
+  # Put the pnpm directory on PATH so that child process can resolve pnpm.
+  $pnpmDir = Split-Path $codexPnpm
+  $env:PATH = "$pnpmDir;$env:PATH"
 }
 
 Push-Location $root

@@ -191,6 +191,8 @@ export function normalizePreset(preset: Partial<Preset>): Preset {
     scalePercent: preset.scalePercent ?? 50,
     customWidth: preset.customWidth ?? 1920,
     customHeight: preset.customHeight ?? 1080,
+    fpsMode: preset.fpsMode === "preset" || preset.fpsMode === "custom" ? preset.fpsMode : "source",
+    fpsValue: Number.isFinite(preset.fpsValue) && (preset.fpsValue as number) > 0 ? (preset.fpsValue as number) : 30,
     bitrateMode: preset.bitrateMode ?? "source_multiplier",
     bitrateMultiplier: preset.bitrateMultiplier ?? 0.3,
     targetBitrateMbps: preset.targetBitrateMbps ?? 20,

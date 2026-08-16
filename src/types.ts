@@ -4,6 +4,7 @@ export type OutputMode = "single_folder" | "in_place" | "subfolder";
 export type NamingMode = "original" | "suffix_prefix";
 export type OutputContainer = "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav";
 export type ResolutionMode = "source" | "short_edge" | "scale_percent" | "custom";
+export type FpsMode = "source" | "preset" | "custom";
 export type HdrMode = "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision";
 export type Chroma = "source" | "420" | "422";
 export type BitDepth = "source" | 8 | 10;
@@ -30,6 +31,8 @@ export interface Preset {
   scalePercent: number;
   customWidth: number;
   customHeight: number;
+  fpsMode: FpsMode;
+  fpsValue: number;
   bitrateMode: "source_multiplier" | "target_mbps";
   bitrateMultiplier: number;
   targetBitrateMbps: number;

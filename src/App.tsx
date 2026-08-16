@@ -55,7 +55,7 @@ import {
   savePreferences,
   startEncode
 } from "./tauri";
-import type { AlphaBackground, AppPreferences, Codec, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
+import type { AlphaBackground, AppPreferences, Codec, EncodeJob, FpsMode, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
 
 const defaultPlatform: PlatformInfo = { os: "unknown", accelerators: ["auto", "cpu"] };
 const defaultToolStatus: ToolStatus = { ffmpeg: "检测中", ffprobe: "检测中", encoders: [], ok: false };
@@ -66,6 +66,18 @@ const codecLabels: Record<Codec, string> = {
   av1: "AV1",
   prores: "ProRes 422 LT"
 };
+
+const commonFpsOptions = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
+
+const fpsLabels: Record<FpsMode, string> = {
+  source: "保持原帧率",
+  preset: "常见帧率",
+  custom: "自定义"
+};
+
+function fpsLabel(value: number) {
+  return `${value} fps`;
+}
 
 const presetDescriptions: Record<Codec, string> = {
   h265: "高效压缩，保留 HDR 与 10bit 色深",
@@ -130,6 +142,8 @@ export default function App() {
   const [advancedOpen, toggleAdvanced] = useToggleState("vsc.settings.advancedOpen", false);
   const [postprocessOpen, togglePostprocess, setPostprocess] = useToggleState("vsc.settings.postprocessOpen", false);
   const [deliveryOpen, toggleDelivery] = useToggleState("vsc.settings.deliveryOpen", true);
+  const [formatOpen, toggleFormat] = useToggleState("vsc.settings.formatOpen", true);
+  const [qualityOpen, toggleQuality] = useToggleState("vsc.settings.qualityOpen", true);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [mediaInfoItemId, setMediaInfoItemId] = useState("");
   const [presetRailCollapsed, setPresetRailCollapsed] = useState(false);
@@ -952,29 +966,29 @@ export default function App() {
           <div className="settings-heading"><span><h2>输出设置</h2><small>仅影响当前任务</small></span><button className="quiet-action" onClick={createPreset}><Plus size={15} />另存为预设</button></div>
           <Setting label="应用预设"><select value={activePresetId} onChange={(event) => choosePreset(event.target.value)}>{!activePresetId && <option value="">自定义设置</option>}{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></Setting>
 
-          <div className="settings-section">
-            <h3>输出格式</h3>
+          <button className="collapse-row" onClick={toggleFormat}><span>输出格式</span><ChevronDown size={17} className={formatOpen ? "rotated" : ""} /></button>
+          {formatOpen && <div className="format-settings">
             <Setting label="格式"><select value={activePreset?.codec ?? "h265"} onChange={(event) => applyCodec(event.target.value as Codec)}>{Object.entries(codecLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
+            <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列/音频默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
             <div className="settings-pair">
               <Setting label="色深"><select value={activePreset?.bitDepth ?? "source"} onChange={(event) => updateActivePreset({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">原视频参数</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Setting>
               <Setting label="色度采样"><select value={activePreset?.chroma ?? "source"} onChange={(event) => updateActivePreset({ chroma: event.target.value as Preset["chroma"] })}><option value="source">原视频参数</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Setting>
             </div>
-          </div>
+          </div>}
 
-          <div className="settings-section">
-            <h3>分辨率</h3>
+          <button className="collapse-row" onClick={toggleQuality}><span>画质</span><ChevronDown size={17} className={qualityOpen ? "rotated" : ""} /></button>
+          {qualityOpen && <div className="quality-settings">
             <Setting label="尺寸"><select value={resolutionValue(activePreset)} onChange={(event) => applyResolution(event.target.value, updateActivePreset)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="scale">缩放至倍率</option><option value="custom">自定义</option></select></Setting>
             {activePreset?.resolutionMode === "scale_percent" && <label className="range-setting"><span>缩放倍率 <strong>{activePreset.scalePercent}%</strong></span><input type="range" min={10} max={90} value={activePreset.scalePercent} onChange={(event) => updateActivePreset({ scalePercent: Number(event.target.value) })} /><small><span>10%</span><span>90%</span></small></label>}
             {activePreset?.resolutionMode === "custom" && <div className="dimension-grid"><Setting label="宽"><input type="number" min={2} value={activePreset.customWidth} onChange={(event) => updateActivePreset({ customWidth: Number(event.target.value) })} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={activePreset.customHeight} onChange={(event) => updateActivePreset({ customHeight: Number(event.target.value) })} /></Setting></div>}
-          </div>
-
-          <div className="settings-section quality-section">
-            <h3>画质</h3>
+            <Setting label="帧率"><select value={activePreset?.fpsMode ?? "source"} onChange={(event) => updateActivePreset({ fpsMode: event.target.value as FpsMode })}>{Object.entries(fpsLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
+            {activePreset?.fpsMode === "preset" && <Setting label="目标帧率"><select value={activePreset.fpsValue} onChange={(event) => updateActivePreset({ fpsValue: Number(event.target.value) })}>{commonFpsOptions.map((fps) => <option key={fps} value={fps}>{fpsLabel(fps)}</option>)}</select></Setting>}
+            {activePreset?.fpsMode === "custom" && <Setting label="目标帧率"><input type="number" min={0.001} step={0.001} value={activePreset.fpsValue} onChange={(event) => updateActivePreset({ fpsValue: Number(event.target.value) })} /></Setting>}
             <Setting label="画质模式"><select value={activePreset?.bitrateMode ?? "source_multiplier"} onChange={(event) => updateActivePreset({ bitrateMode: event.target.value as Preset["bitrateMode"] })}><option value="source_multiplier">智能压缩</option><option value="target_mbps">指定码率</option></select></Setting>
             <label className="range-setting"><span>预计码率 {qualityEditing
               ? <input className="inline-number-editor" autoFocus type="number" step={activePreset?.bitrateMode === "target_mbps" ? .01 : .1} value={activePreset?.bitrateMode === "target_mbps" ? activePreset.targetBitrateMbps : Number(((activePreset?.bitrateMultiplier ?? .3) * 100).toFixed(2))} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} onBlur={() => setQualityEditing(false)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === "Escape") setQualityEditing(false); }} />
               : <strong title="双击手动输入" onDoubleClick={() => setQualityEditing(true)}>{activePreset?.bitrateMode === "target_mbps" ? `${activePreset.targetBitrateMbps} Mbps` : `${Number(((activePreset?.bitrateMultiplier ?? .3) * 100).toFixed(2))}% 源码率`}</strong>}</span><input type="range" min={activePreset?.bitrateMode === "target_mbps" ? .1 : 1} max={activePreset?.bitrateMode === "target_mbps" ? 150 : 95} step={activePreset?.bitrateMode === "target_mbps" ? .1 : 1} value={activePreset?.bitrateMode === "target_mbps" ? Math.min(150, Math.max(.1, activePreset.targetBitrateMbps)) : Math.min(95, Math.max(1, Math.round((activePreset?.bitrateMultiplier ?? .3) * 100)))} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} /><small><span>{activePreset?.bitrateMode === "target_mbps" ? "0.1 Mbps" : "1%"}</span><span>{activePreset?.bitrateMode === "target_mbps" ? "150 Mbps" : "95%"}</span></small></label>
-          </div>
+          </div>}
 
           <label className="time-preservation-card">
             <input type="checkbox" checked={activePreset?.keepTimes ?? true} onChange={(event) => updateActivePreset({ keepTimes: event.target.checked })} />
@@ -1007,7 +1021,6 @@ export default function App() {
           <button className="collapse-row" onClick={toggleDelivery}><span>输出与命名</span><ChevronDown size={17} className={deliveryOpen ? "rotated" : ""} /></button>
           {deliveryOpen && <div className="delivery-settings">
             <Setting label="输出策略"><select value={activePreset?.outputMode ?? "subfolder"} onChange={(event) => updateActivePreset({ outputMode: event.target.value as Preset["outputMode"] })}><option value="single_folder">全部到同一目录</option><option value="in_place">原位导出</option><option value="subfolder">原位子文件夹</option></select></Setting>
-            <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列/音频默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
             <Setting label="命名"><select value={activePreset?.namingMode ?? "suffix_prefix"} onChange={(event) => updateActivePreset({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
             {activePreset?.namingMode === "suffix_prefix" && <div className="naming-grid"><Setting label="前缀"><input value={activePreset.prefix} onChange={(event) => updateActivePreset({ prefix: event.target.value })} placeholder="可选" /></Setting><Setting label="后缀"><input value={activePreset.suffix} onChange={(event) => updateActivePreset({ suffix: event.target.value })} placeholder="_compressed" /></Setting></div>}
           </div>}
@@ -1163,7 +1176,11 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
       <Setting label="分辨率"><select value={resolutionValue(draft)} onChange={(event) => applyResolution(event.target.value, onChange)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="scale">缩放至倍率</option><option value="custom">自定义</option></select></Setting>
       <Setting label="码率模式"><select value={draft.bitrateMode} onChange={(event) => onChange({ bitrateMode: event.target.value as Preset["bitrateMode"] })}><option value="source_multiplier">按源视频比例</option><option value="target_mbps">指定码率</option></select></Setting>
       <Setting label={draft.bitrateMode === "target_mbps" ? "目标码率 Mbps" : "源码率比例 %"}><input type="number" step={draft.bitrateMode === "target_mbps" ? .01 : .1} value={draft.bitrateMode === "target_mbps" ? draft.targetBitrateMbps : Number((draft.bitrateMultiplier * 100).toFixed(2))} onChange={(event) => draft.bitrateMode === "target_mbps" ? onChange({ targetBitrateMbps: Number(event.target.value) }) : onChange({ bitrateMultiplier: Number(event.target.value) / 100 })} /></Setting>
-    </div></div>
+    </div>
+    <Setting label="帧率"><select value={draft.fpsMode} onChange={(event) => onChange({ fpsMode: event.target.value as FpsMode })}>{Object.entries(fpsLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
+    {draft.fpsMode === "preset" && <Setting label="目标帧率"><select value={draft.fpsValue} onChange={(event) => onChange({ fpsValue: Number(event.target.value) })}>{commonFpsOptions.map((fps) => <option key={fps} value={fps}>{fpsLabel(fps)}</option>)}</select></Setting>}
+    {draft.fpsMode === "custom" && <Setting label="目标帧率"><input type="number" min={0.001} step={0.001} value={draft.fpsValue} onChange={(event) => onChange({ fpsValue: Number(event.target.value) })} /></Setting>}
+    </div>
     {draft.resolutionMode === "scale_percent" && <label className="range-setting"><span>缩放倍率 <strong>{draft.scalePercent}%</strong></span><input type="range" min={10} max={90} value={draft.scalePercent} onChange={(event) => onChange({ scalePercent: Number(event.target.value) })} /></label>}
     {draft.resolutionMode === "custom" && <div className="dimension-grid modal-dimensions"><Setting label="宽"><input type="number" min={2} value={draft.customWidth} onChange={(event) => onChange({ customWidth: Number(event.target.value) })} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={draft.customHeight} onChange={(event) => onChange({ customHeight: Number(event.target.value) })} /></Setting></div>}
     <div className="modal-section"><h3>色彩与编码</h3><div className="modal-grid three-columns">
@@ -1286,7 +1303,7 @@ function hdrPatch(hdrMode: Preset["hdrMode"], preset?: Preset): Partial<Preset> 
     return { hdrMode, colorSpace: "rec2020", bitDepth: 10, hardware: "cpu", codec: preset?.codec === "h264" ? "h265" : preset?.codec };
   }
   if (hdrMode === "dolby_vision") {
-    return { hdrMode, codec: "h265", bitDepth: 10, chroma: "420", resolutionMode: "source", lutEnabled: false };
+    return { hdrMode, codec: "h265", bitDepth: 10, chroma: "420", resolutionMode: "source", lutEnabled: false, fpsMode: "source" };
   }
   return { hdrMode, colorSpace: hdrMode === "sdr" ? "rec709" : "source" };
 }
