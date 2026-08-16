@@ -148,6 +148,12 @@ export async function cancelEncode(sessionId: string): Promise<void> {
   return invoke("cancel_encode", { sessionId });
 }
 
+/** Reveal a media file (or its containing folder) in the native file manager. */
+export async function revealPath(path: string): Promise<void> {
+  if (!path || !isTauriRuntime) return;
+  await invoke("reveal_path", { path });
+}
+
 export function onEncodeProgress(handler: (payload: EncodeProgress) => void) {
   if (!isTauriRuntime) return Promise.resolve(() => undefined);
   return listen<EncodeProgress>("encode-progress", (event) => handler(event.payload));

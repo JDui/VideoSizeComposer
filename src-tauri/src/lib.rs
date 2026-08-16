@@ -182,7 +182,8 @@ pub fn run() {
             probe_paths,
             probe_sequence_paths,
             start_encode,
-            cancel_encode
+            cancel_encode,
+            reveal_path
         ])
         .setup(|app| {
             let path = presets_path(app.handle())?;
@@ -234,6 +235,75 @@ fn get_tool_status() -> ToolStatus {
         encoders,
         ok: ffmpeg_ok && ffprobe_ok,
     }
+}
+
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let requested = PathBuf::from(path);
+    let existing_directory = nearest_existing_directory(&requested);
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("explorer.exe");
+        if requested.is_file() {
+            command.arg(format!("/select,{}", requested.display()));
+        } else {
+            command.arg(existing_directory);
+        }
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法打开文件夹：{error}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        if requested.is_file() {
+            command.arg("-R").arg(&requested);
+        } else {
+            command.arg(existing_directory);
+        }
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法打开文件夹：{error}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(existing_directory)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法打开文件夹：{error}"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = existing_directory;
+        Err("当前平台不支持打开文件夹".into())
+    }
+}
+
+fn nearest_existing_directory(path: &Path) -> PathBuf {
+    let mut candidate = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
+    while !candidate.exists() {
+        let Some(parent) = candidate.parent() else {
+            return PathBuf::from(".");
+        };
+        if parent == candidate {
+            return PathBuf::from(".");
+        }
+        candidate = parent.to_path_buf();
+    }
+    candidate
 }
 
 fn detected_encoders() -> Vec<String> {

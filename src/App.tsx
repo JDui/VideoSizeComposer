@@ -13,7 +13,6 @@ import {
   Film,
   Folder,
   FolderOpen,
-  Gauge,
   HelpCircle,
   Images,
   LoaderCircle,
@@ -50,6 +49,7 @@ import {
   pickVideoFiles,
   probePaths,
   probeSequencePaths,
+  revealPath,
   savePreset,
   savePreferences,
   startEncode
@@ -94,12 +94,11 @@ export default function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [filter, setFilter] = useState("");
   const [presetFilter, setPresetFilter] = useState("");
-  const [step, setStep] = useState<1 | 2 | 3>(1);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [postprocessOpen, setPostprocessOpen] = useState(false);
   const [deliveryOpen, setDeliveryOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [detailItemId, setDetailItemId] = useState("");
+  const [mediaInfoItemId, setMediaInfoItemId] = useState("");
   const [presetRailCollapsed, setPresetRailCollapsed] = useState(false);
   const [presetListOpen, setPresetListOpen] = useState(true);
   const [presetEditorOpen, setPresetEditorOpen] = useState(false);
@@ -278,7 +277,6 @@ export default function App() {
     try {
       const paths = await getPaths();
       if (!paths.length) return;
-      setStep(1);
       setLastError("");
       const items = await probePaths(paths, activePreset.id);
       setQueue((existing) => mergeQueue(existing, items.map((item) => ({ ...item, selected: true, status: "就绪" }))));
@@ -302,7 +300,6 @@ export default function App() {
     try {
       const paths = await getPaths();
       if (!paths.length) return;
-      setStep(1);
       setLastError("");
       const items = await probeSequencePaths(paths, activePreset.id, preferences.defaultSequenceFps);
       setQueue((existing) => mergeQueue(existing, items.map((item) => ({
@@ -348,7 +345,6 @@ export default function App() {
     setQueue((items) => items.map((item) => item.selected && item.presetId === next.id
       ? { ...item, output: previewOutput(item, next), progress: 0, status: item.status.includes("编码") ? item.status : "就绪" }
       : item));
-    setStep(2);
   }
 
   function choosePreset(id: string) {
@@ -363,7 +359,6 @@ export default function App() {
           : item
       )
     );
-    setStep(2);
   }
 
   function createPreset() {
@@ -453,10 +448,31 @@ export default function App() {
     if (isItemEncoding(item)) return;
     setQueue((items) => items.filter((entry) => entry.id !== item.id));
     setActiveJobIds((ids) => ids.filter((id) => id !== item.id));
-    setDetailItemId((id) => id === item.id ? "" : id);
-    if (detailItemId === item.id) setDetailsOpen(false);
+    setMediaInfoItemId((id) => id === item.id ? "" : id);
     setContextMenu(undefined);
     setNotice(`已删除 ${item.fileName}`);
+  }
+
+  function openMediaInfo(item: QueueItem) {
+    setMediaInfoItemId(item.id);
+    setContextMenu(undefined);
+  }
+
+  function togglePanorama(itemId: string) {
+    setQueue((items) => items.map((item) => item.id === itemId
+      ? { ...item, isPanorama: !item.isPanorama }
+      : item));
+  }
+
+  async function revealItemPath(path: string) {
+    if (!path) return;
+    try {
+      await revealPath(path);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLastError(message);
+      setNotice("无法打开文件夹");
+    }
   }
 
   async function chooseOutputFolder() {
@@ -515,7 +531,7 @@ export default function App() {
   function clearQueue() {
     if (preferences.confirmBeforeClear && !window.confirm("清空当前媒体列表？")) return;
     setQueue([]);
-    setDetailItemId("");
+    setMediaInfoItemId("");
   }
 
   function applyCodec(codec: Codec) {
@@ -532,7 +548,6 @@ export default function App() {
       .filter((job): job is EncodeJob => Boolean(job.preset));
     if (!jobs.length || !toolStatus.ok) return;
 
-    setStep(3);
     if (preferences.autoOpenDetails) setDetailsOpen(true);
     setLastError("");
     setEncodingIds(jobs.map((job) => job.item.id));
@@ -741,23 +756,10 @@ export default function App() {
               {!filteredPresets.length && <span className="no-presets">没有匹配的预设，可点击“新建”创建。</span>}
             </div>}
 
-          <div className="hardware-card">
-            <div className="hardware-card-title"><span>硬件与性能</span><Gauge size={16} /></div>
-            <button className="hardware-toggle-row" onClick={() => updateActivePreset({ hardware: activePreset?.hardware === "cpu" ? "auto" : "cpu" })}><span>硬件加速</span><span className={`switch-visual ${activePreset?.hardware !== "cpu" ? "on" : ""}`}><span /></span></button>
-            {platform.accelerators.filter((item) => item !== "auto").map((accelerator) => (
-              <button className={`hardware-row ${activePreset?.hardware === accelerator ? "selected" : ""}`} key={accelerator} onClick={() => updateActivePreset({ hardware: accelerator })}>
-                <span className={`status-dot ${accelerator === "cpu" ? "blue" : ""}`} />
-                <strong>{accelerator === "cuda" ? "CUDA" : accelerator === "metal" ? "Metal" : "CPU"}</strong>
-                <small>{accelerator === "cuda" ? "NVIDIA GPU" : accelerator === "metal" ? "Apple GPU" : "自动回退"}</small>
-              </button>
-            ))}
-          </div>
           </>}
         </aside>
 
         <section className="main-workbench">
-          <StageStepper step={step} onStep={setStep} />
-
           <section className={`forecast-panel ${isEncoding ? "is-encoding" : ""}`} aria-label="压缩结果预测">
             <div className="forecast-size">
               <span className="eyebrow">预计效果 · 选中 {selectedItems.length} 个文件</span>
@@ -765,9 +767,6 @@ export default function App() {
               <small>预计减少 {savings}% · 根据当前预设估算</small>
             </div>
             {isEncoding && <div className="forecast-metric encode-forecast"><Clock3 size={18} /><span><strong>{remainingTimeLabel}</strong><small>根据当前编码速度估算</small></span></div>}
-            <button className="output-location" onClick={chooseOutputFolder}>
-              <span><small>输出位置</small><strong>{shortPath(outputDirectory(activePreset))}</strong></span><FolderOpen size={18} />
-            </button>
           </section>
 
           <section className="queue-panel">
@@ -801,6 +800,7 @@ export default function App() {
               {visibleItems.length ? visibleItems.map((item, index) => {
                 const itemPreset = presetForItem(item, presets, activePreset);
                 const predicted = estimateOutputBytes(item, itemPreset);
+                const outputPath = item.output || (itemPreset ? previewOutput(item, itemPreset) : "");
                 return (
                   <article
                     className={`media-row ${item.selected ? "is-selected" : ""}`}
@@ -810,11 +810,11 @@ export default function App() {
                     onContextMenu={(event) => openContextMenu("media", item.id, event)}
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
-                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : <Film size={19} />}</span>}<span><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}</span></div>
-                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.isPanorama && <em>{item.panoramaTagged ? "360° 已识别" : "360° 画幅候选"}</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}</span></div>
+                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small><button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}</span></div>
+                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}<button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} title="点击切换全景状态" onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button></span></div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
-                    <StatusCell item={item} />
-                    <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); setDetailItemId(item.id); setDetailsOpen(true); }}><ChevronRight size={19} /></button>
+                    <StatusCell item={item} outputPath={outputPath} onRevealPath={revealItemPath} />
+                    <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); openMediaInfo(item); }}><ChevronRight size={19} /></button>
                   </article>
                 );
               }) : (
@@ -830,8 +830,8 @@ export default function App() {
 
           {detailsOpen && (
             <section className="details-drawer" aria-live="polite">
-              <div><strong>{detailItemId ? queue.find((item) => item.id === detailItemId)?.fileName : isEncoding ? "正在压缩" : completedCount ? "最近一次任务" : "任务详情"}</strong><span>完成 {completedCount} · 失败 {failedCount} · 总计 {queue.length}</span></div>
-              <div className="details-log">{detailItemId ? mediaDetail(queue.find((item) => item.id === detailItemId)) : lastError || log[0] || "等待任务"}</div>
+              <div><strong>{isEncoding ? "正在压缩" : completedCount ? "最近一次任务" : "任务详情"}</strong><span>完成 {completedCount} · 失败 {failedCount} · 总计 {queue.length}</span></div>
+              <div className="details-log">{lastError || log[0] || "等待任务"}</div>
               <button className="quiet-action" onClick={() => setDetailsOpen(false)}>收起</button>
             </section>
           )}
@@ -951,7 +951,7 @@ export default function App() {
             if (!item) return null;
             const disabled = isItemEncoding(item);
             return <>
-              <button role="menuitem" onClick={() => { setDetailItemId(item.id); setDetailsOpen(true); setContextMenu(undefined); }}>查看源信息</button>
+              <button role="menuitem" onClick={() => openMediaInfo(item)}>查看源信息</button>
               <button role="menuitem" disabled={disabled} onClick={() => resetQueueItem(item)}>重置状态</button>
               <button role="menuitem" className="danger" disabled={disabled} onClick={() => deleteQueueItem(item)}>删除</button>
             </>;
@@ -961,20 +961,32 @@ export default function App() {
 
       {settingsOpen && <Modal title="应用设置" onClose={() => setSettingsOpen(false)} footer={<><button className="secondary-button" onClick={() => setPreferencesDraft(defaultPreferences)}>恢复默认</button><button className="primary-button" onClick={commitPreferences}>保存设置</button></>}>
         <div className="modal-grid two-columns">
-          <Setting label="默认编码设备"><select value={preferencesDraft.defaultHardware} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: event.target.value as Hardware }))}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
           <Setting label="默认输出策略"><select value={preferencesDraft.defaultOutputMode} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultOutputMode: event.target.value as Preset["outputMode"] }))}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
           <Setting label="序列帧默认帧率"><input type="number" min={0.001} step={0.001} value={preferencesDraft.defaultSequenceFps} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultSequenceFps: Number(event.target.value) }))} /></Setting>
         </div>
         {preferencesDraft.defaultOutputMode === "single_folder" && <button className="secondary-button full" onClick={chooseDefaultOutputFolder}><FolderOpen size={15} />{preferencesDraft.defaultOutputDir ? shortPath(preferencesDraft.defaultOutputDir) : "选择默认输出目录"}</button>}
+        <div className="modal-section hardware-settings-section">
+          <h3>硬件与性能</h3>
+          <Setting label="默认编码设备"><select value={preferencesDraft.defaultHardware} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: event.target.value as Hardware }))}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
+          <label className="hardware-toggle-row settings-hardware-toggle"><span>启用硬件加速</span><input type="checkbox" checked={preferencesDraft.defaultHardware !== "cpu"} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: event.target.checked ? (platform.accelerators.includes("cuda") ? "cuda" : platform.accelerators.includes("metal") ? "metal" : "auto") : "cpu" }))} /><span className={`switch-visual ${preferencesDraft.defaultHardware !== "cpu" ? "on" : ""}`}><span /></span></label>
+          <div className="hardware-device-list"><span className="field-note">可用设备</span>{platform.accelerators.filter((item) => item !== "auto").map((accelerator) => <button className={`hardware-row ${preferencesDraft.defaultHardware === accelerator ? "selected" : ""}`} key={accelerator} onClick={() => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: accelerator }))}><span className={`status-dot ${accelerator === "cpu" ? "blue" : ""}`} /><strong>{accelerator === "cuda" ? "CUDA" : accelerator === "metal" ? "Metal" : "CPU"}</strong><small>{accelerator === "cuda" ? "NVIDIA GPU" : accelerator === "metal" ? "Apple GPU" : "自动回退"}</small></button>)}</div>
+          <div className="environment-card"><strong>编码环境</strong><span>{toolStatus.ok ? "FFmpeg 与 FFprobe 可用" : "编码工具不可用"}</span><small>{toolStatus.ffmpeg}</small><small>{toolStatus.ffprobe}</small><small>{toolStatus.encoders.length ? `可用编码器：${toolStatus.encoders.join("、")}` : "未检测到硬件编码器"}</small></div>
+        </div>
         <div className="preference-list">
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.keepTimesByDefault} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, keepTimesByDefault: event.target.checked }))} /><span>新任务默认保留创建日期与修改时间</span></label>
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.confirmBeforeClear} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, confirmBeforeClear: event.target.checked }))} /><span>清空媒体列表前要求确认</span></label>
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.autoOpenDetails} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, autoOpenDetails: event.target.checked }))} /><span>开始编码时自动展开任务详情</span></label>
         </div>
         <div className="version-card" aria-label={`软件版本 ${packageVersion}`}><span><strong>软件版本</strong><small>功能版本 {functionVersion}</small></span><code>{packageVersion}</code></div>
-        <div className="environment-card"><strong>编码环境</strong><span>{toolStatus.ok ? "FFmpeg 与 FFprobe 可用" : "编码工具不可用"}</span><small>{toolStatus.ffmpeg}</small></div>
         <button className="secondary-button full" onClick={applyPreferenceDefaults}>将这些默认值应用到当前任务</button>
       </Modal>}
+
+      {mediaInfoItemId && (() => {
+        const item = queue.find((entry) => entry.id === mediaInfoItemId);
+        if (!item) return null;
+        const itemPreset = presetForItem(item, presets, activePreset);
+        return <MediaInfoModal item={item} outputPath={item.output || (itemPreset ? previewOutput(item, itemPreset) : "")} onClose={() => setMediaInfoItemId("")} onTogglePanorama={() => togglePanorama(item.id)} onRevealSource={() => revealItemPath(item.source)} onRevealOutput={(path) => revealItemPath(path)} />;
+      })()}
 
       {helpOpen && <Modal title="使用帮助" onClose={() => setHelpOpen(false)} footer={<button className="primary-button" onClick={() => setHelpOpen(false)}>知道了</button>}>
         <div className="help-steps">
@@ -1059,20 +1071,60 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
   </Modal>;
 }
 
-function StageStepper({ step, onStep }: { step: 1 | 2 | 3; onStep: (step: 1 | 2 | 3) => void }) {
-  const steps: Array<{ id: 1 | 2 | 3; label: string }> = [{ id: 1, label: "添加媒体" }, { id: 2, label: "选择输出" }, { id: 3, label: "开始压缩" }];
-  return <nav className="stage-stepper" aria-label="压缩步骤">{steps.map((item) => <button key={item.id} className={step === item.id ? "active" : step > item.id ? "done" : ""} onClick={() => onStep(item.id)}><span>{step > item.id ? <Check size={13} /> : item.id}</span>{item.label}</button>)}</nav>;
-}
-
 function SearchField({ value, onChange, placeholder, compact = false }: { value: string; onChange: (value: string) => void; placeholder: string; compact?: boolean }) {
   return <label className={`search-field ${compact ? "compact" : ""}`}><Search size={15} /><input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} /></label>;
+}
+
+function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealSource, onRevealOutput }: {
+  item: QueueItem;
+  outputPath: string;
+  onClose: () => void;
+  onTogglePanorama: () => void;
+  onRevealSource: () => void;
+  onRevealOutput: (path: string) => void;
+}) {
+  const mediaType = item.mediaKind === "sequence" ? "序列帧媒体" : "视频文件";
+  const color = [item.colorSpace || "未知", item.colorTransfer || "未知"].join(" · ");
+  const tracks = `${item.audioTracks} 条音轨 · ${item.subtitleTracks} 条字幕`;
+  return <Modal title={`源信息 · ${item.fileName}`} onClose={onClose} footer={<button className="primary-button" onClick={onClose}>关闭</button>}>
+    <div className="media-info-hero">
+      {item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 缩略图`} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={26} /> : <Film size={26} />}</span>}
+      <div><strong>{item.fileName}</strong><small>{mediaType} · {item.status} · 进度 {item.progress}%</small><button className="path-link info-path" title={item.source} onClick={onRevealSource}>{item.source}</button></div>
+    </div>
+    <div className="media-info-grid">
+      <InfoField label="文件名" value={item.fileName} />
+      <InfoField label="媒体类型" value={mediaType} />
+      <InfoField label="分辨率" value={`${item.width} × ${item.height}`} />
+      <InfoField label="帧率" value={item.fps} />
+      <InfoField label="时长" value={formatDuration(item.duration)} />
+      <InfoField label="文件体积" value={formatBytes(item.sizeBytes)} />
+      <InfoField label="码率" value={item.bitrate > 0 ? `${(item.bitrate / 1_000_000).toFixed(2)} Mbps` : "未知"} />
+      <InfoField label="视频编码" value={item.codec || "未知"} />
+      <InfoField label="位深" value={`${item.bitDepth}-bit`} />
+      <InfoField label="色度采样" value={`4:2:${item.chroma.slice(-1)}`} />
+      <InfoField label="色彩空间 / 传递" value={color} />
+      <InfoField label="HDR" value={hdrLabel(item.hdrMode)} />
+      <InfoField label="Alpha 通道" value={item.hasAlpha ? "有" : "无"} />
+      <InfoField label="音轨 / 字幕" value={tracks} />
+      <InfoField label="全景状态" value={item.isPanorama ? "全景视频" : "非全景视频"} />
+      <InfoField label="自动识别" value={item.panoramaTagged ? "已识别全景元数据" : "未检测到标准全景标记"} />
+      <InfoField label="当前状态" value={`${item.status} · ${item.progress}%`} />
+      <InfoField label="预设" value={item.presetId || "未选择"} />
+    </div>
+    <div className="media-info-section"><h3>全景与输出</h3><div className="media-info-actions"><button className={`panorama-toggle info-panorama-toggle ${item.isPanorama ? "is-on" : ""}`} onClick={onTogglePanorama}>{item.isPanorama ? "全景视频" : "非全景视频"}</button><small>{item.panoramaTagged ? "状态来自自动识别，也可以手动切换" : "可手动切换全景标记"}</small></div><button className="path-link info-output-path" title={outputPath || "未设置输出路径"} disabled={!outputPath} onClick={() => outputPath && onRevealOutput(outputPath)}>{outputPath || "未设置输出路径"}</button></div>
+    {item.mediaKind === "sequence" && <div className="media-info-section"><h3>序列信息</h3><div className="media-info-grid compact"><InfoField label="序列模式" value={item.sequencePattern || "未知"} /><InfoField label="起始帧号" value={String(item.sequenceStartNumber)} /><InfoField label="帧数" value={String(item.sequenceFrameCount)} /><InfoField label="序列帧率" value={`${item.sequenceFps} fps`} /><InfoField label="像素宽幅" value={`${item.sequencePixelAspect}x`} /></div></div>}
+  </Modal>;
+}
+
+function InfoField({ label, value }: { label: string; value: string }) {
+  return <div className="info-field"><small>{label}</small><strong title={value}>{value}</strong></div>;
 }
 
 function Setting({ label, children }: { label: string; children: React.ReactNode }) {
   return <label className="setting-field"><span>{label}</span>{children}</label>;
 }
 
-function StatusCell({ item }: { item: QueueItem }) {
+function StatusCell({ item, outputPath, onRevealPath }: { item: QueueItem; outputPath: string; onRevealPath: (path: string) => void }) {
   const failed = item.status.includes("失败");
   const complete = item.status.includes("完成");
   const cancelled = item.status.includes("取消");
@@ -1081,6 +1133,7 @@ function StatusCell({ item }: { item: QueueItem }) {
   return <div className={`status-cell ${failed ? "failed" : complete ? "complete" : cancelled ? "cancelled" : active ? "active" : "ready"}`}>
     <strong>{failed ? "失败" : complete ? "已完成" : cancelled ? "已取消" : active ? item.progress > 0 && !item.status.includes("%") ? `${item.status} ${item.progress}%` : item.status : "就绪"}</strong>
     {complete ? <small>{timePreserved ? "创建与修改时间已保留" : "输出已生成"}</small> : cancelled ? <small>未生成输出文件</small> : active ? <span className="row-progress"><span style={{ width: `${item.progress}%` }} /></span> : <small>等待开始</small>}
+    {outputPath && <button className="path-link status-output-path" title={outputPath} onClick={(event) => { event.stopPropagation(); onRevealPath(outputPath); }}>{shortPath(outputPath)}</button>}
   </div>;
 }
 
@@ -1117,12 +1170,6 @@ function hdrPatch(hdrMode: Preset["hdrMode"], preset?: Preset): Partial<Preset> 
     return { hdrMode, codec: "h265", bitDepth: 10, chroma: "420", resolutionMode: "source", lutEnabled: false };
   }
   return { hdrMode, colorSpace: hdrMode === "sdr" ? "rec709" : "source" };
-}
-
-function mediaDetail(item?: QueueItem) {
-  if (!item) return "媒体信息不可用";
-  const tracks = `${item.audioTracks} 音轨${item.subtitleTracks ? ` · ${item.subtitleTracks} 字幕` : ""}`;
-  return `${item.width}×${item.height} · ${item.fps} · ${item.bitDepth}-bit · 4:2:${item.chroma.slice(-1)} · ${hdrLabel(item.hdrMode)}${item.hasAlpha ? " · Alpha" : ""} · ${tracks}`;
 }
 
 function estimateOutputBytes(item: QueueItem, preset?: Preset) {
@@ -1198,13 +1245,13 @@ function previewOutput(item: QueueItem, preset: Preset) {
   const directory = slash >= 0 ? item.source.slice(0, slash) : ".";
   const fileName = slash >= 0 ? item.source.slice(slash + 1) : item.source;
   const dot = fileName.lastIndexOf(".");
-  const rawStem = dot > -1 ? fileName.slice(0, dot) : fileName;
-  const patternStem = item.sequencePattern.replace(/\.[^.]+$/, "").replace(/%0?\d*d/i, "");
+  const hasExtension = dot > 0 && dot < fileName.length - 1;
+  const rawStem = hasExtension ? fileName.slice(0, dot) : fileName;
   const stem = item.mediaKind === "sequence"
-    ? (patternStem || rawStem.replace(/[\d_.\- ]+$/, "") || rawStem).replace(/[_\-. ]+$/, "")
+    ? sequenceBaseName(rawStem)
     : rawStem;
   const name = preset.namingMode === "original" ? stem : `${preset.prefix}${stem}${preset.suffix}`;
-  const sourceExtension = dot > -1 ? fileName.slice(dot).toLowerCase() : "";
+  const sourceExtension = hasExtension ? fileName.slice(dot).toLowerCase() : "";
   const extension = preset.outputContainer === "source"
     ? item.mediaKind === "sequence" ? ".mp4" : sourceExtension || (preset.codec === "prores" ? ".mov" : ".mp4")
     : `.${preset.outputContainer}`;
@@ -1214,6 +1261,17 @@ function previewOutput(item: QueueItem, preset: Preset) {
       ? directory
       : `${directory}/VideoSizeComposer`;
   return `${outputDirectory}/${name}${extension}`;
+}
+
+function sequenceBaseName(stem: string) {
+  // Mirrors Rust split_sequence_stem: keep the last contiguous digit run,
+  // so frame_001 -> frame, shot2_frame001 -> shot2_frame, 001_left -> left.
+  const match = stem.match(/^(.*?)(\d+)([^\d]*)$/);
+  if (!match) return stem;
+  const prefix = match[1].replace(/[_\-. ]+$/, "");
+  const suffix = match[3].replace(/^[_\-. ]+/, "");
+  if (prefix && suffix) return `${prefix}_${suffix}`;
+  return prefix || suffix || "sequence";
 }
 
 function mergeQueue(existing: QueueItem[], incoming: QueueItem[]) {
