@@ -14,7 +14,7 @@ use std::{
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
@@ -2212,20 +2212,47 @@ fn run_ffmpeg(
     cancel: &Arc<AtomicBool>,
     phase: &EncodePhase,
 ) -> Result<(), String> {
-    let mut child = command_with_hidden_window(resolve_tool("ffmpeg"))
-        .args(args)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("无法启动 FFmpeg: {error}"))?;
+    let child = Arc::new(Mutex::new(
+        command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(args)
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("无法启动 FFmpeg: {error}"))?,
+    ));
+
+    // 独立线程监听取消标志：即使 FFmpeg 不再向 stderr 输出进度（例如进入收尾阶段），
+    // 也能立即终止进程，保证任务可靠进入“已取消”终态。进程正常结束后线程自行退出。
+    let cancel_watch = cancel.clone();
+    let watcher_child = child.clone();
+    thread::spawn(move || loop {
+        if cancel_watch.load(Ordering::Relaxed) {
+            if let Ok(mut guard) = watcher_child.lock() {
+                let _ = guard.kill();
+            }
+            return;
+        }
+        let exited = match watcher_child.lock() {
+            Ok(mut guard) => guard.try_wait().ok().flatten().is_some(),
+            Err(_) => true,
+        };
+        if exited {
+            return;
+        }
+        thread::sleep(Duration::from_millis(60));
+    });
 
     let mut tail = Vec::new();
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = child
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.stderr.take())
+    {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.lock().map(|mut guard| guard.kill());
+                let _ = child.lock().map(|mut guard| guard.wait());
                 return Err(CANCELLED_ERROR.into());
             }
             if !line.trim().is_empty() {
@@ -2253,12 +2280,16 @@ fn run_ffmpeg(
     }
 
     if cancel.load(Ordering::Relaxed) {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.lock().map(|mut guard| guard.kill());
+        let _ = child.lock().map(|mut guard| guard.wait());
         return Err(CANCELLED_ERROR.into());
     }
 
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let status = child
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.wait().ok())
+        .ok_or_else(|| "无法等待 FFmpeg 结束".to_string())?;
     if status.success() {
         Ok(())
     } else {

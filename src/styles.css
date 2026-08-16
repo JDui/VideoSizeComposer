@@ -232,6 +232,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .status-cell strong { color: var(--mint); font-size: 11px; font-weight: 620; }
 .status-cell.failed strong { color: var(--danger); }
 .status-cell.cancelled strong { color: #ffc69f; }
+.status-cell.cancelling strong { color: #ffc69f; }
 .status-cell.active strong { color: var(--cyan); }
 .status-output-path { width: 100%; max-width: 100%; }
 .row-progress { width: 100%; height: 3px; border-radius: 2px; background: #28404a; overflow: hidden; }

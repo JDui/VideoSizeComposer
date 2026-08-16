@@ -157,6 +157,7 @@ export default function App() {
   const [log, setLog] = useState<string[]>(["FFmpeg 环境检测中…", "等待添加媒体"]);
   const simulationTimer = useRef<number | null>(null);
   const importInProgress = useRef(false);
+  const cancellingRef = useRef<Set<string>>(new Set());
   const queueBodyRef = useRef<HTMLDivElement>(null);
   const selectionAnchorId = useRef("");
   const suppressRowClick = useRef(false);
@@ -244,26 +245,32 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onEncodeProgress((payload) => {
+      const terminal = payload.ok === true || payload.ok === false;
+      const isCancelling = cancellingRef.current.has(payload.itemId);
       setQueue((items) =>
-        items.map((item) =>
-          item.id === payload.itemId
-              ? {
-                ...item,
-                progress: Math.max(item.progress, payload.progress),
-                status: payload.status,
-                output: payload.output ?? item.output,
-                alphaOutput: payload.ok === false
-                  && !payload.status.includes("时间恢复失败")
-                  && (payload.status.includes("失败") || payload.status.includes("取消"))
-                  ? ""
-                  : payload.alphaOutput ?? item.alphaOutput
-              }
-            : item
-        )
+        items.map((item) => {
+          if (item.id !== payload.itemId) return item;
+          // 取消进行中：忽略非终态进度更新，避免把“正在取消”覆盖回“编码中”
+          if (isCancelling && !terminal) {
+            return { ...item, progress: Math.max(item.progress, payload.progress) };
+          }
+          return {
+            ...item,
+            progress: Math.max(item.progress, payload.progress),
+            status: payload.status,
+            output: payload.output ?? item.output,
+            alphaOutput: payload.ok === false
+              && !payload.status.includes("时间恢复失败")
+              && (payload.status.includes("失败") || payload.status.includes("取消"))
+              ? ""
+              : payload.alphaOutput ?? item.alphaOutput
+          };
+        })
       );
       if (payload.message) setLog((lines) => [payload.message!, ...lines].slice(0, 120));
       if (payload.ok === false && payload.message) setLastError(payload.message);
-      if (payload.ok === true || payload.ok === false) {
+      if (terminal) {
+        cancellingRef.current.delete(payload.itemId);
         setEncodingIds((ids) => ids.filter((id) => id !== payload.itemId));
       }
     }).then((dispose) => {
@@ -703,9 +710,18 @@ export default function App() {
       return;
     }
     if (!activeSessionId) return;
+    const pending = new Set(encodingIds);
     try {
       await cancelEncode(activeSessionId);
+      pending.forEach((id) => cancellingRef.current.add(id));
+      setQueue((items) => items.map((item) => pending.has(item.id) ? { ...item, status: "正在取消" } : item));
       setLog((lines) => ["正在取消编码任务…", ...lines].slice(0, 120));
+      // 兜底：若后端事件迟迟未到，确保任务最终进入“已取消”终态
+      window.setTimeout(() => {
+        setQueue((items) => items.map((item) => cancellingRef.current.has(item.id) ? { ...item, status: "已取消", progress: 0 } : item));
+        pending.forEach((id) => cancellingRef.current.delete(id));
+        setEncodingIds((ids) => ids.filter((id) => !pending.has(id)));
+      }, 45000);
     } catch (error) {
       setLastError(error instanceof Error ? error.message : String(error));
     }
@@ -1226,14 +1242,16 @@ function Setting({ label, children }: { label: string; children: React.ReactNode
 }
 
 function StatusCell({ item, outputPath, onRevealPath }: { item: QueueItem; outputPath: string; onRevealPath: (path: string) => void }) {
+  const cancelling = item.status === "正在取消";
   const failed = item.status.includes("失败");
   const complete = item.status.includes("完成");
-  const cancelled = item.status.includes("取消");
-  const active = item.status.includes("编码") || item.status.includes("排队") || item.status.includes("Alpha");
+  const cancelled = !cancelling && item.status.includes("取消");
+  const active = !cancelling && (item.status.includes("编码") || item.status.includes("排队") || item.status.includes("Alpha"));
   const timePreserved = item.status.includes("原始时间");
-  return <div className={`status-cell ${failed ? "failed" : complete ? "complete" : cancelled ? "cancelled" : active ? "active" : "ready"}`}>
-    <strong>{failed ? "失败" : complete ? "已完成" : cancelled ? "已取消" : active ? item.progress > 0 && !item.status.includes("%") ? `${item.status} ${item.progress}%` : item.status : "就绪"}</strong>
-    {complete ? <small>{timePreserved ? "创建与修改时间已保留" : "输出已生成"}</small> : cancelled ? <small>未生成输出文件</small> : active ? <span className="row-progress"><span style={{ width: `${item.progress}%` }} /></span> : <small>等待开始</small>}
+  const stateClass = failed ? "failed" : complete ? "complete" : cancelled ? "cancelled" : cancelling ? "cancelling" : active ? "active" : "ready";
+  return <div className={`status-cell ${stateClass}`}>
+    <strong>{failed ? "失败" : complete ? "已完成" : cancelled ? "已取消" : cancelling ? "正在取消" : active ? item.progress > 0 && !item.status.includes("%") ? `${item.status} ${item.progress}%` : item.status : "就绪"}</strong>
+    {complete ? <small>{timePreserved ? "创建与修改时间已保留" : "输出已生成"}</small> : cancelled ? <small>未生成输出文件</small> : cancelling ? <small>正在终止进程…</small> : active ? <span className="row-progress"><span style={{ width: `${item.progress}%` }} /></span> : <small>等待开始</small>}
     {outputPath && <button className="path-link status-output-path" title={outputPath} onClick={(event) => { event.stopPropagation(); onRevealPath(outputPath); }}>{shortPath(outputPath)}</button>}
   </div>;
 }
