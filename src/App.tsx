@@ -42,6 +42,7 @@ import {
   onEncodeProgress,
   onNativeDrop,
   pickFolder,
+  pickAudioFiles,
   pickLutFiles,
   pickOutputFolder,
   pickSequenceFolder,
@@ -110,8 +111,8 @@ export default function App() {
   const [sequenceDraft, setSequenceDraft] = useState<QueueItem>();
   const [contextMenu, setContextMenu] = useState<ContextMenuState>();
   const [qualityEditing, setQualityEditing] = useState(false);
-  const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
-  const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(loadPreferences);
+  const [preferences, setPreferences] = useState<AppPreferences>(defaultPreferences);
+  const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(defaultPreferences);
   const [encodingIds, setEncodingIds] = useState<string[]>([]);
   const [isImporting, setIsImporting] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -165,29 +166,47 @@ export default function App() {
     : "";
 
   useEffect(() => {
+    let cancelled = false;
     getPlatformInfo().then(setPlatform);
     getToolStatus().then((status) => {
       setToolStatus(status);
       setLog(status.ok ? ["FFmpeg 与 ffprobe 已就绪", "等待添加媒体"] : ["编码工具检测失败"]);
     });
-    loadPresets().then(async (items) => {
-      const normalized = items.map(normalizePreset);
-      const initial = normalized[0] ?? normalizePreset({
-        id: crypto.randomUUID(),
-        name: "未保存的输出设置",
-        hardware: preferences.defaultHardware,
-        outputMode: preferences.defaultOutputMode,
-        outputDir: preferences.defaultOutputDir,
-        keepTimes: preferences.keepTimesByDefault
-      });
-      setPresets(normalized);
-      setActivePresetId(normalized[0]?.id ?? "");
-      setOutputPreset(initial);
-      if (!isTauriRuntime) {
-        const demo = await probePaths(["demo"], initial.id);
-        setQueue(demo.map((item) => ({ ...item, selected: true, status: "就绪", progress: 0 })));
+    (async () => {
+      try {
+        const loadedPreferences = await loadPreferences();
+        if (cancelled) return;
+        setPreferences(loadedPreferences);
+        setPreferencesDraft(loadedPreferences);
+        const items = await loadPresets();
+        if (cancelled) return;
+        const normalized = items.map(normalizePreset);
+        const initial = normalized[0] ?? normalizePreset({
+          id: crypto.randomUUID(),
+          name: "未保存的输出设置",
+          hardware: loadedPreferences.defaultHardware,
+          outputMode: loadedPreferences.defaultOutputMode,
+          outputDir: loadedPreferences.defaultOutputDir,
+          keepTimes: loadedPreferences.keepTimesByDefault
+        });
+        setPresets(normalized);
+        setActivePresetId(normalized[0]?.id ?? "");
+        setOutputPreset(initial);
+        if (!isTauriRuntime) {
+          const demo = await probePaths(["demo"], initial.id);
+          if (!cancelled) setQueue(demo.map((item) => ({ ...item, selected: true, status: "就绪", progress: 0 })));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : String(error);
+          setLastError(message);
+          setLog((lines) => [`便携配置加载失败：${message}`, ...lines].slice(0, 120));
+        }
       }
-    });
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -196,11 +215,16 @@ export default function App() {
       setQueue((items) =>
         items.map((item) =>
           item.id === payload.itemId
-            ? {
+              ? {
                 ...item,
                 progress: Math.max(item.progress, payload.progress),
                 status: payload.status,
-                output: payload.output ?? item.output
+                output: payload.output ?? item.output,
+                alphaOutput: payload.ok === false
+                  && !payload.status.includes("时间恢复失败")
+                  && (payload.status.includes("失败") || payload.status.includes("取消"))
+                  ? ""
+                  : payload.alphaOutput ?? item.alphaOutput
               }
             : item
         )
@@ -280,8 +304,8 @@ export default function App() {
       setLastError("");
       const items = await probePaths(paths, activePreset.id);
       setQueue((existing) => mergeQueue(existing, items.map((item) => ({ ...item, selected: true, status: "就绪" }))));
-      setLog((lines) => [`已导入 ${items.length} 个视频`, ...lines].slice(0, 120));
-      if (!items.length) setLastError("没有找到可导入的视频，或媒体信息读取失败。");
+      setLog((lines) => ["已导入 " + items.length + " 个媒体", ...lines].slice(0, 120));
+      if (!items.length) setLastError("没有找到可导入的媒体，或媒体信息读取失败。");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setLastError(message);
@@ -475,6 +499,32 @@ export default function App() {
     }
   }
 
+  async function chooseExternalAudio(itemId: string) {
+    const paths = await pickAudioFiles();
+    const audio = paths[0];
+    if (!audio) return;
+    setQueue((items) => items.map((item) => item.id === itemId
+      ? { ...item, externalAudio: audio, status: item.status.includes("编码") ? item.status : "就绪", progress: 0 }
+      : item));
+    setNotice("已添加外接音频");
+  }
+
+  function clearExternalAudio(itemId: string) {
+    setQueue((items) => items.map((item) => item.id === itemId ? { ...item, externalAudio: "" } : item));
+  }
+
+  function toggleAlphaMask(itemId: string, enabled: boolean) {
+    setQueue((items) => items.map((item) => item.id === itemId && item.hasAlpha && item.mediaKind !== "audio"
+      ? { ...item, exportAlphaMask: enabled, alphaOutput: enabled ? item.alphaOutput : "" }
+      : item));
+  }
+
+  function updateAudioVisual(itemId: string, audioVisual: QueueItem["audioVisual"]) {
+    setQueue((items) => items.map((item) => item.id === itemId && item.mediaKind === "audio"
+      ? { ...item, audioVisual }
+      : item));
+  }
+
   async function chooseOutputFolder() {
     const folder = await pickOutputFolder();
     if (folder) updateActivePreset({ outputDir: folder, outputMode: "single_folder" });
@@ -504,14 +554,21 @@ export default function App() {
     if (folder) setPreferencesDraft((draft) => ({ ...draft, defaultOutputDir: folder, defaultOutputMode: "single_folder" }));
   }
 
-  function commitPreferences() {
+  async function commitPreferences() {
     const next = {
       ...preferencesDraft,
       defaultSequenceFps: Number.isFinite(preferencesDraft.defaultSequenceFps) && preferencesDraft.defaultSequenceFps > 0
         ? preferencesDraft.defaultSequenceFps
         : defaultPreferences.defaultSequenceFps
     };
-    savePreferences(next);
+    try {
+      await savePreferences(next);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLastError(message);
+      setNotice("应用设置保存失败");
+      return;
+    }
     setPreferences(next);
     setPreferencesDraft(next);
     setSettingsOpen(false);
@@ -555,7 +612,9 @@ export default function App() {
     setEncodeStartedAt(Date.now());
     setClockNow(Date.now());
     setQueue((items) =>
-      items.map((item) => (item.selected ? { ...item, status: "排队中", progress: 0 } : item))
+      items.map((item) => (item.selected
+        ? { ...item, status: "排队中", progress: 0, alphaOutput: "" }
+        : item))
     );
     try {
       const session = await startEncode(jobs);
@@ -584,7 +643,10 @@ export default function App() {
                 progress,
                 status: progress >= 100
                   ? activePreset?.keepTimes ? "完成 · 已保留原始时间" : "完成"
-                  : `编码中 ${progress}%`
+                  : `编码中 ${progress}%`,
+                alphaOutput: progress >= 100 && item.exportAlphaMask && item.hasAlpha
+                  ? previewAlphaOutput(item.output || previewOutput(item, activePreset ?? normalizePreset({})))
+                  : item.alphaOutput
               }
             : item
         )
@@ -773,9 +835,10 @@ export default function App() {
             <header className="queue-toolbar">
               <div className="queue-actions">
                 <div className="add-media-control">
-                  <button className="secondary-button" disabled={isImporting} onClick={() => setAddMenuOpen((open) => !open)}>{isImporting ? <LoaderCircle className="loading-spinner" size={17} /> : <Plus size={17} />}{isImporting ? "载入中…" : "添加视频"}<ChevronDown size={14} /></button>
+                  <button className="secondary-button" disabled={isImporting} onClick={() => setAddMenuOpen((open) => !open)}>{isImporting ? <LoaderCircle className="loading-spinner" size={17} /> : <Plus size={17} />}{isImporting ? "载入中…" : "添加媒体"}<ChevronDown size={14} /></button>
                   {addMenuOpen && <div className="add-media-menu">
-                    <button onClick={() => { setAddMenuOpen(false); importVideos(pickVideoFiles); }}><Film size={17} /><span><strong>视频文件</strong><small>选择一个或多个视频</small></span></button>
+                    <button onClick={() => { setAddMenuOpen(false); importVideos(pickVideoFiles); }}><Film size={17} /><span><strong>视频文件</strong><small>选择一个或多个视频媒体</small></span></button>
+                    <button onClick={() => { setAddMenuOpen(false); importVideos(pickAudioFiles); }}><Zap size={17} /><span><strong>音频文件</strong><small>WAV、MP3、FLAC、AAC、M4A 等</small></span></button>
                     <button onClick={() => { setAddMenuOpen(false); setSequenceImportOpen(true); }}><Images size={17} /><span><strong>序列帧媒体</strong><small>选择文件夹或序列中的一帧</small></span></button>
                   </div>}
                 </div>
@@ -810,15 +873,15 @@ export default function App() {
                     onContextMenu={(event) => openContextMenu("media", item.id, event)}
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
-                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small><button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}</span></div>
-                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.bitDepth}-bit · 4:2:{item.chroma.slice(-1)} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}<button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} title="点击切换全景状态" onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button></span></div>
+                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : item.mediaKind === "audio" ? <Zap size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : item.mediaKind === "audio" ? `音频 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small><button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}{item.mediaKind === "audio" && <label className="row-inline-control" title="音频素材输出视频时使用的画面模式" onClick={(event) => event.stopPropagation()}><span>画面</span><select value={item.audioVisual} onChange={(event) => updateAudioVisual(item.id, event.target.value as QueueItem["audioVisual"])}><option value="timecode">时间码</option><option value="black">纯黑</option><option value="white">纯白</option></select></label>}{item.mediaKind !== "audio" && item.audioTracks === 0 && <button className="audio-attach-control" title={item.externalAudio || "添加外接音频"} onClick={(event) => { event.stopPropagation(); chooseExternalAudio(item.id); }}>{item.externalAudio ? `已添加音频 · ${shortPath(item.externalAudio)}` : "无音轨 · 添加音频"}</button>}{item.externalAudio && item.mediaKind !== "audio" && <button className="audio-clear-control" aria-label="清除外接音频" title="清除外接音频" onClick={(event) => { event.stopPropagation(); clearExternalAudio(item.id); }}><X size={11} /></button>}</span></div>
+                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.mediaKind === "audio" ? "纯音频" : `${item.bitDepth || 8}-bit · 4:2:${item.chroma.slice(-1)}`} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.exportAlphaMask && <em>Alpha 遮罩已启用</em>}{item.mediaKind === "audio" && <em>音频素材</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}{item.mediaKind !== "audio" && <button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} title="点击切换全景状态" onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button>}</span>{item.hasAlpha && item.mediaKind !== "audio" && <label className="alpha-mask-control" title="从源 Alpha 通道生成独立黑白视频" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={item.exportAlphaMask} onChange={(event) => toggleAlphaMask(item.id, event.target.checked)} /><span>单独导出 Alpha 遮罩</span></label>}</div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
                     <StatusCell item={item} outputPath={outputPath} onRevealPath={revealItemPath} />
                     <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); openMediaInfo(item); }}><ChevronRight size={19} /></button>
                   </article>
                 );
               }) : (
-                <div className="empty-state"><FilePlus2 size={28} /><strong>添加媒体开始压缩</strong><span>支持视频文件与序列帧媒体</span><button className="secondary-button" disabled={isImporting} onClick={() => setAddMenuOpen(true)}>选择媒体</button></div>
+                <div className="empty-state"><FilePlus2 size={28} /><strong>添加媒体开始压缩</strong><span>支持视频、音频文件与序列帧媒体</span><button className="secondary-button" disabled={isImporting} onClick={() => setAddMenuOpen(true)}>选择媒体</button></div>
               )}
             </div>
             {isImporting && <div className="import-loading" role="status" aria-live="polite"><LoaderCircle className="loading-spinner" size={28} /><strong>正在载入视频…</strong><span>正在读取媒体信息，请稍候</span></div>}
@@ -892,7 +955,7 @@ export default function App() {
           <button className="collapse-row" onClick={() => setDeliveryOpen((open) => !open)}><span>输出与命名</span><ChevronDown size={17} className={deliveryOpen ? "rotated" : ""} /></button>
           {deliveryOpen && <div className="delivery-settings">
             <Setting label="输出策略"><select value={activePreset?.outputMode ?? "subfolder"} onChange={(event) => updateActivePreset({ outputMode: event.target.value as Preset["outputMode"] })}><option value="single_folder">全部到同一目录</option><option value="in_place">原位导出</option><option value="subfolder">原位子文件夹</option></select></Setting>
-            <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option></select></Setting>
+            <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列/音频默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
             {activePreset?.outputMode === "single_folder" && <button className="secondary-button full" onClick={chooseOutputFolder}><FolderOpen size={15} />{activePreset.outputDir ? shortPath(activePreset.outputDir) : "选择输出目录"}</button>}
             <Setting label="命名"><select value={activePreset?.namingMode ?? "suffix_prefix"} onChange={(event) => updateActivePreset({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
             {activePreset?.namingMode === "suffix_prefix" && <div className="naming-grid"><Setting label="前缀"><input value={activePreset.prefix} onChange={(event) => updateActivePreset({ prefix: event.target.value })} placeholder="可选" /></Setting><Setting label="后缀"><input value={activePreset.suffix} onChange={(event) => updateActivePreset({ suffix: event.target.value })} placeholder="_compressed" /></Setting></div>}
@@ -1059,7 +1122,7 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
     </div></div>
     <div className="modal-section"><h3>输出与后处理</h3><div className="modal-grid two-columns">
       <Setting label="输出策略"><select value={draft.outputMode} onChange={(event) => onChange({ outputMode: event.target.value as Preset["outputMode"] })}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
-      <Setting label="封装格式"><select value={draft.outputContainer} onChange={(event) => onChange({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A</option></select></Setting>
+      <Setting label="封装格式"><select value={draft.outputContainer} onChange={(event) => onChange({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
       <Setting label="命名"><select value={draft.namingMode} onChange={(event) => onChange({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
       <Setting label="Alpha 背景"><select value={draft.alphaBackground} onChange={(event) => onChange({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Setting>
     </div>
@@ -1083,12 +1146,12 @@ function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealS
   onRevealSource: () => void;
   onRevealOutput: (path: string) => void;
 }) {
-  const mediaType = item.mediaKind === "sequence" ? "序列帧媒体" : "视频文件";
+  const mediaType = item.mediaKind === "sequence" ? "序列帧媒体" : item.mediaKind === "audio" ? "音频文件" : "视频文件";
   const color = [item.colorSpace || "未知", item.colorTransfer || "未知"].join(" · ");
   const tracks = `${item.audioTracks} 条音轨 · ${item.subtitleTracks} 条字幕`;
   return <Modal title={`源信息 · ${item.fileName}`} onClose={onClose} footer={<button className="primary-button" onClick={onClose}>关闭</button>}>
     <div className="media-info-hero">
-      {item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 缩略图`} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={26} /> : <Film size={26} />}</span>}
+      {item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 缩略图`} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={26} /> : item.mediaKind === "audio" ? <Zap size={26} /> : <Film size={26} />}</span>}
       <div><strong>{item.fileName}</strong><small>{mediaType} · {item.status} · 进度 {item.progress}%</small><button className="path-link info-path" title={item.source} onClick={onRevealSource}>{item.source}</button></div>
     </div>
     <div className="media-info-grid">
@@ -1100,8 +1163,8 @@ function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealS
       <InfoField label="文件体积" value={formatBytes(item.sizeBytes)} />
       <InfoField label="码率" value={item.bitrate > 0 ? `${(item.bitrate / 1_000_000).toFixed(2)} Mbps` : "未知"} />
       <InfoField label="视频编码" value={item.codec || "未知"} />
-      <InfoField label="位深" value={`${item.bitDepth}-bit`} />
-      <InfoField label="色度采样" value={`4:2:${item.chroma.slice(-1)}`} />
+      <InfoField label="位深" value={item.mediaKind === "audio" ? "不适用" : `${item.bitDepth || 8}-bit`} />
+      <InfoField label="色度采样" value={item.mediaKind === "audio" ? "不适用" : `4:2:${item.chroma.slice(-1)}`} />
       <InfoField label="色彩空间 / 传递" value={color} />
       <InfoField label="HDR" value={hdrLabel(item.hdrMode)} />
       <InfoField label="Alpha 通道" value={item.hasAlpha ? "有" : "无"} />
@@ -1110,8 +1173,11 @@ function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealS
       <InfoField label="自动识别" value={item.panoramaTagged ? "已识别全景元数据" : "未检测到标准全景标记"} />
       <InfoField label="当前状态" value={`${item.status} · ${item.progress}%`} />
       <InfoField label="预设" value={item.presetId || "未选择"} />
+      <InfoField label="音频画面" value={item.mediaKind === "audio" ? audioVisualLabel(item.audioVisual) : "不适用"} />
+      <InfoField label="外接音频" value={item.externalAudio || "未添加"} />
+      <InfoField label="Alpha 遮罩" value={item.hasAlpha ? (item.exportAlphaMask ? "已启用独立导出" : "未启用") : "无 Alpha 通道"} />
     </div>
-    <div className="media-info-section"><h3>全景与输出</h3><div className="media-info-actions"><button className={`panorama-toggle info-panorama-toggle ${item.isPanorama ? "is-on" : ""}`} onClick={onTogglePanorama}>{item.isPanorama ? "全景视频" : "非全景视频"}</button><small>{item.panoramaTagged ? "状态来自自动识别，也可以手动切换" : "可手动切换全景标记"}</small></div><button className="path-link info-output-path" title={outputPath || "未设置输出路径"} disabled={!outputPath} onClick={() => outputPath && onRevealOutput(outputPath)}>{outputPath || "未设置输出路径"}</button></div>
+    <div className="media-info-section"><h3>全景与输出</h3>{item.mediaKind !== "audio" && <div className="media-info-actions"><button className={`panorama-toggle info-panorama-toggle ${item.isPanorama ? "is-on" : ""}`} onClick={onTogglePanorama}>{item.isPanorama ? "全景视频" : "非全景视频"}</button><small>{item.panoramaTagged ? "状态来自自动识别，也可以手动切换" : "可手动切换全景标记"}</small></div>}<button className="path-link info-output-path" title={outputPath || "未设置输出路径"} disabled={!outputPath} onClick={() => outputPath && onRevealOutput(outputPath)}>{outputPath || "未设置输出路径"}</button>{item.alphaOutput && <button className="path-link info-output-path alpha-output-path" title={item.alphaOutput} onClick={() => onRevealOutput(item.alphaOutput)}>Alpha 输出：{item.alphaOutput}</button>}</div>
     {item.mediaKind === "sequence" && <div className="media-info-section"><h3>序列信息</h3><div className="media-info-grid compact"><InfoField label="序列模式" value={item.sequencePattern || "未知"} /><InfoField label="起始帧号" value={String(item.sequenceStartNumber)} /><InfoField label="帧数" value={String(item.sequenceFrameCount)} /><InfoField label="序列帧率" value={`${item.sequenceFps} fps`} /><InfoField label="像素宽幅" value={`${item.sequencePixelAspect}x`} /></div></div>}
   </Modal>;
 }
@@ -1128,7 +1194,7 @@ function StatusCell({ item, outputPath, onRevealPath }: { item: QueueItem; outpu
   const failed = item.status.includes("失败");
   const complete = item.status.includes("完成");
   const cancelled = item.status.includes("取消");
-  const active = item.status.includes("编码") || item.status.includes("排队");
+  const active = item.status.includes("编码") || item.status.includes("排队") || item.status.includes("Alpha");
   const timePreserved = item.status.includes("原始时间");
   return <div className={`status-cell ${failed ? "failed" : complete ? "complete" : cancelled ? "cancelled" : active ? "active" : "ready"}`}>
     <strong>{failed ? "失败" : complete ? "已完成" : cancelled ? "已取消" : active ? item.progress > 0 && !item.status.includes("%") ? `${item.status} ${item.progress}%` : item.status : "就绪"}</strong>
@@ -1174,17 +1240,30 @@ function hdrPatch(hdrMode: Preset["hdrMode"], preset?: Preset): Partial<Preset> 
 
 function estimateOutputBytes(item: QueueItem, preset?: Preset) {
   if (!preset || !item.duration) return 0;
+  const outputContainer = preset.outputContainer === "source" && item.mediaKind === "audio" ? "mp4" : preset.outputContainer;
+  if (outputContainer === "wav") {
+    return Math.max(44_100, Math.round(item.duration * 48_000 * 3));
+  }
+  if (item.mediaKind === "audio" && outputContainer === "m4a") {
+    return Math.max(32_000, Math.round(item.duration * 320_000 / 8));
+  }
   if (preset.hdrMode === "dolby_vision") return item.sizeBytes;
-  if (preset.codec === "prores") return Math.max(item.sizeBytes, item.duration * 100_000_000 / 8);
+  if (preset.codec === "prores") {
+    const value = Math.max(item.sizeBytes, item.duration * 100_000_000 / 8);
+    return item.exportAlphaMask && item.hasAlpha ? value * 1.3 : value;
+  }
   if (preset.bitrateMode === "source_multiplier" && item.sizeBytes > 0) {
     const videoShare = item.sizeBytes * preset.bitrateMultiplier;
-    const audioOverhead = item.duration * 320_000 / 8;
-    return Math.min(item.sizeBytes, Math.max(1_000_000, (videoShare + audioOverhead) * 1.025));
+    const audioOverhead = item.audioTracks > 0 || item.externalAudio ? item.duration * 320_000 / 8 : 0;
+    const value = Math.max(1_000_000, (videoShare + audioOverhead) * 1.025);
+    return item.exportAlphaMask && item.hasAlpha ? value * 1.3 : value;
   }
   const videoBitrate = preset.bitrateMode === "source_multiplier" && item.bitrate > 0
     ? item.bitrate * preset.bitrateMultiplier
     : preset.targetBitrateMbps * 1_000_000;
-  return Math.min(item.sizeBytes, Math.max(1_000_000, (videoBitrate + 320_000) * item.duration / 8 * 1.025));
+  const audioBitrate = item.audioTracks > 0 || item.externalAudio ? 320_000 : 0;
+  const value = Math.max(1_000_000, (videoBitrate + audioBitrate) * item.duration / 8 * 1.025);
+  return item.exportAlphaMask && item.hasAlpha ? value * 1.3 : value;
 }
 
 function targetResolution(item: QueueItem, preset?: Preset) {
@@ -1233,6 +1312,12 @@ function alphaBackgroundLabel(background?: AlphaBackground) {
   return "棋盘格";
 }
 
+function audioVisualLabel(visual: QueueItem["audioVisual"]) {
+  if (visual === "black") return "纯黑画面";
+  if (visual === "white") return "纯白画面";
+  return "居中时间码";
+}
+
 function deriveFunctionVersion(version: string) {
   const [year, feature] = version.split(".");
   return /^\d{4}$/.test(year ?? "") && /^\d+$/.test(feature ?? "")
@@ -1253,7 +1338,7 @@ function previewOutput(item: QueueItem, preset: Preset) {
   const name = preset.namingMode === "original" ? stem : `${preset.prefix}${stem}${preset.suffix}`;
   const sourceExtension = hasExtension ? fileName.slice(dot).toLowerCase() : "";
   const extension = preset.outputContainer === "source"
-    ? item.mediaKind === "sequence" ? ".mp4" : sourceExtension || (preset.codec === "prores" ? ".mov" : ".mp4")
+    ? item.mediaKind === "sequence" || item.mediaKind === "audio" ? ".mp4" : sourceExtension || (preset.codec === "prores" ? ".mov" : ".mp4")
     : `.${preset.outputContainer}`;
   const outputDirectory = preset.outputMode === "single_folder" && preset.outputDir
     ? preset.outputDir
@@ -1261,6 +1346,15 @@ function previewOutput(item: QueueItem, preset: Preset) {
       ? directory
       : `${directory}/VideoSizeComposer`;
   return `${outputDirectory}/${name}${extension}`;
+}
+
+function previewAlphaOutput(output: string) {
+  if (!output) return "";
+  const slash = Math.max(output.lastIndexOf("/"), output.lastIndexOf("\\"));
+  const directory = slash >= 0 ? output.slice(0, slash + 1) : "";
+  const fileName = slash >= 0 ? output.slice(slash + 1) : output;
+  const dot = fileName.lastIndexOf(".");
+  return `${directory}${dot > 0 ? `${fileName.slice(0, dot)}_alpha${fileName.slice(dot)}` : `${fileName}_alpha`}`;
 }
 
 function sequenceBaseName(stem: string) {

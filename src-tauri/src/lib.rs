@@ -6,8 +6,8 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    io::{self, BufRead, BufReader},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,6 +27,9 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 const SEQUENCE_EXTENSIONS: &[&str] = &[
     "bmp", "dpx", "exr", "jpeg", "jpg", "png", "tga", "tif", "tiff", "webp",
 ];
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "aac", "ac3", "aif", "aiff", "eac3", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav", "wma",
+];
 const CANCELLED_ERROR: &str = "__VSC_CANCELLED__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +37,32 @@ const CANCELLED_ERROR: &str = "__VSC_CANCELLED__";
 struct PlatformInfo {
     os: String,
     accelerators: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AppPreferences {
+    default_hardware: String,
+    default_output_mode: String,
+    default_output_dir: String,
+    keep_times_by_default: bool,
+    confirm_before_clear: bool,
+    auto_open_details: bool,
+    default_sequence_fps: f64,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            default_hardware: "auto".into(),
+            default_output_mode: "subfolder".into(),
+            default_output_dir: String::new(),
+            keep_times_by_default: true,
+            confirm_before_clear: true,
+            auto_open_details: true,
+            default_sequence_fps: 30.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +178,14 @@ struct QueueItem {
     sequence_pixel_aspect: f64,
     #[serde(default)]
     sequence_frames: Vec<String>,
+    #[serde(default)]
+    export_alpha_mask: bool,
+    #[serde(default)]
+    alpha_output: String,
+    #[serde(default)]
+    external_audio: String,
+    #[serde(default = "default_audio_visual")]
+    audio_visual: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +204,52 @@ struct EncodeProgress {
     output: Option<String>,
     ok: Option<bool>,
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alpha_output: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum EncodePhase {
+    Main {
+        reserve_alpha: bool,
+    },
+    Alpha {
+        main_output: String,
+        alpha_output: String,
+    },
+}
+
+/// Keep the final success event as the only 100% event while reserving 90–99%
+/// for the independent Alpha pass.
+fn phase_progress(raw: u8, phase: &EncodePhase) -> u8 {
+    let raw = raw.min(99) as u16;
+    match phase {
+        EncodePhase::Main {
+            reserve_alpha: true,
+        } => raw.min(89) as u8,
+        EncodePhase::Main {
+            reserve_alpha: false,
+        } => raw as u8,
+        EncodePhase::Alpha { .. } => (90 + ((raw * 9 + 99) / 100)) as u8,
+    }
+}
+
+fn phase_status(raw: u8, phase: &EncodePhase) -> String {
+    let progress = phase_progress(raw, phase);
+    match phase {
+        EncodePhase::Main { .. } => format!("编码中 {progress}%"),
+        EncodePhase::Alpha { .. } => format!("生成 Alpha 遮罩 {progress}%"),
+    }
+}
+
+fn phase_output_paths(output: &Path, phase: &EncodePhase) -> (String, Option<String>) {
+    match phase {
+        EncodePhase::Main { .. } => (output.to_string_lossy().to_string(), None),
+        EncodePhase::Alpha {
+            main_output,
+            alpha_output,
+        } => (main_output.clone(), Some(alpha_output.clone())),
+    }
 }
 
 pub fn run() {
@@ -178,6 +261,8 @@ pub fn run() {
             load_presets,
             save_preset,
             delete_preset,
+            load_preferences,
+            save_preferences,
             import_lut_files,
             probe_paths,
             probe_sequence_paths,
@@ -186,7 +271,7 @@ pub fn run() {
             reveal_path
         ])
         .setup(|app| {
-            let path = presets_path(app.handle())?;
+            let path = presets_path(app.handle()).map_err(io::Error::other)?;
             if !path.exists() {
                 write_presets(&path, &default_presets())?;
             }
@@ -339,43 +424,73 @@ fn detected_encoders() -> Vec<String> {
 
 #[tauri::command]
 fn load_presets(app: tauri::AppHandle) -> Result<Vec<Preset>, String> {
-    let path = presets_path(&app).map_err(|error| error.to_string())?;
+    let config = portable_config_dir(&app)?;
+    let exe_dir = executable_dir_path()?;
+    let path = config.join("presets.json");
     if !path.exists() {
-        write_presets(&path, &default_presets()).map_err(|error| error.to_string())?;
+        write_presets(&path, &default_presets())
+            .map_err(|error| format_portable_write_error(&path, error))?;
     }
-    read_presets(&path).map_err(|error| error.to_string())
+    let mut presets = read_presets(&path).map_err(|error| error.to_string())?;
+    if normalize_preset_lut_names(&mut presets, &exe_dir) {
+        write_presets(&path, &presets)
+            .map_err(|error| format_portable_write_error(&path, error))?;
+    }
+    Ok(presets)
 }
 
 #[tauri::command]
 fn save_preset(app: tauri::AppHandle, preset: Preset) -> Result<Vec<Preset>, String> {
-    let path = presets_path(&app).map_err(|error| error.to_string())?;
+    let config = portable_config_dir(&app)?;
+    let exe_dir = executable_dir_path()?;
+    let path = config.join("presets.json");
+    let mut preset = preset;
+    normalize_preset_lut_name(&mut preset, &exe_dir);
     let mut presets = read_presets(&path).unwrap_or_else(|_| default_presets());
+    normalize_preset_lut_names(&mut presets, &exe_dir);
     if let Some(existing) = presets.iter_mut().find(|item| item.id == preset.id) {
         *existing = preset;
     } else {
         presets.push(preset);
     }
-    write_presets(&path, &presets).map_err(|error| error.to_string())?;
+    write_presets(&path, &presets).map_err(|error| format_portable_write_error(&path, error))?;
     Ok(presets)
 }
 
 #[tauri::command]
 fn delete_preset(app: tauri::AppHandle, id: String) -> Result<Vec<Preset>, String> {
-    let path = presets_path(&app).map_err(|error| error.to_string())?;
+    let config = portable_config_dir(&app)?;
+    let exe_dir = executable_dir_path()?;
+    let path = config.join("presets.json");
     let mut presets = read_presets(&path).unwrap_or_else(|_| default_presets());
+    normalize_preset_lut_names(&mut presets, &exe_dir);
     presets.retain(|preset| preset.id != id);
-    write_presets(&path, &presets).map_err(|error| error.to_string())?;
+    write_presets(&path, &presets).map_err(|error| format_portable_write_error(&path, error))?;
     Ok(presets)
 }
 
 #[tauri::command]
+fn load_preferences(app: tauri::AppHandle) -> Result<Option<AppPreferences>, String> {
+    let config = portable_config_dir(&app)?;
+    let path = config.join("preferences.json");
+    read_preferences(&path)
+        .map_err(|error| format!("无法读取便携偏好设置 {}：{error}", path.display()))
+}
+
+#[tauri::command]
+fn save_preferences(app: tauri::AppHandle, preferences: AppPreferences) -> Result<(), String> {
+    let config = portable_config_dir(&app)?;
+    let path = config.join("preferences.json");
+    write_preferences(&path, &preferences)
+        .map_err(|error| format_portable_write_error(&path, error))
+}
+
+#[tauri::command]
 fn import_lut_files(app: tauri::AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
-    let base = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| error.to_string())?
-        .join("luts");
-    fs::create_dir_all(&base).map_err(|error| error.to_string())?;
+    let config = portable_config_dir(&app)?;
+    let exe_dir = executable_dir_path()?;
+    let base = config.join("luts");
+    fs::create_dir_all(&base).map_err(|error| format_portable_write_error(&base, error))?;
     let mut imported = Vec::new();
 
     for raw in paths {
@@ -387,9 +502,11 @@ fn import_lut_files(app: tauri::AppHandle, paths: Vec<String>) -> Result<Vec<Str
             continue;
         };
         let target = unique_child_path(&base, file_name);
-        fs::copy(&source, &target)
-            .map_err(|error| format!("无法导入 LUT {}: {error}", source.display()))?;
-        imported.push(target.to_string_lossy().to_string());
+        if source != target {
+            fs::copy(&source, &target)
+                .map_err(|error| format!("无法导入 LUT {}: {error}", source.display()))?;
+        }
+        imported.push(normalize_lut_storage_path(&exe_dir, &target));
     }
 
     Ok(imported)
@@ -403,20 +520,20 @@ async fn probe_paths(paths: Vec<String>, preset_id: String) -> Result<Vec<QueueI
 }
 
 fn probe_paths_impl(paths: Vec<String>, preset_id: String) -> Result<Vec<QueueItem>, String> {
-    let video_paths = collect_video_files(paths);
-    if video_paths.is_empty() {
-        return Err("没有找到支持的视频文件".into());
+    let media_paths = collect_media_files(paths);
+    if media_paths.is_empty() {
+        return Err("没有找到支持的媒体文件（视频或音频）".into());
     }
     let mut items = Vec::new();
     let mut errors = Vec::new();
-    for path in video_paths {
+    for path in media_paths {
         match probe_video(&path, &preset_id) {
             Ok(item) => items.push(item),
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
     if items.is_empty() {
-        return Err(format!("无法读取视频信息：\n{}", errors.join("\n")));
+        return Err(format!("无法读取媒体信息：\n{}", errors.join("\n")));
     }
     for error in errors {
         eprintln!("probe failed: {error}");
@@ -674,6 +791,18 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
     if jobs.is_empty() {
         return Err("没有可编码的任务".into());
     }
+    let exe_dir = executable_dir_path()?;
+    let jobs = jobs
+        .into_iter()
+        .map(|mut job| {
+            if job.preset.lut_enabled && !job.preset.lut_name.trim().is_empty() {
+                job.preset.lut_name = resolve_stored_lut_path(&exe_dir, &job.preset.lut_name)
+                    .to_string_lossy()
+                    .to_string();
+            }
+            job
+        })
+        .collect::<Vec<_>>();
     preflight_jobs(&jobs)?;
     let session_id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -699,6 +828,7 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
                         output: None,
                         ok: Some(false),
                         message: Some(message),
+                        alpha_output: None,
                     },
                 );
             }
@@ -750,6 +880,27 @@ fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
             .entry(directory)
             .and_modify(|total| *total = total.saturating_add(required))
             .or_insert(required);
+        if job.item.export_alpha_mask {
+            let alpha_output = build_alpha_output_path(&output);
+            let alpha_directory = alpha_output
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            required_by_directory
+                .entry(alpha_directory)
+                .and_modify(|total| {
+                    *total = total.saturating_add(
+                        estimated_output_bytes(&job.item, &job.preset)
+                            .saturating_mul(30)
+                            .saturating_div(100),
+                    )
+                })
+                .or_insert(
+                    estimated_output_bytes(&job.item, &job.preset)
+                        .saturating_mul(30)
+                        .saturating_div(100),
+                );
+        }
     }
 
     for (directory, required) in required_by_directory {
@@ -796,11 +947,12 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
     }
     if !matches!(
         preset.output_container.as_str(),
-        "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a"
+        "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav"
     ) {
         return Err(format!("不支持的封装格式：{}", preset.output_container));
     }
-    if preset.lut_enabled && !Path::new(&preset.lut_name).is_file() {
+    let exe_dir = executable_dir_path()?;
+    if preset.lut_enabled && !resolve_stored_lut_path(&exe_dir, &preset.lut_name).is_file() {
         return Err(format!("LUT 文件不存在：{}", preset.lut_name));
     }
     if preset.lut_enabled && !filter_available("lut3d") {
@@ -824,8 +976,47 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
 fn validate_job(job: &EncodeJob) -> Result<(), String> {
     validate_preset(&job.preset)?;
     let container = output_extension(&job.item, &job.preset);
-    if container == "m4a" && job.item.audio_tracks == 0 {
-        return Err(format!("“{}”没有音轨，不能导出为 M4A", job.item.file_name));
+    let has_external_audio = !job.item.external_audio.trim().is_empty();
+    if has_external_audio {
+        let external = Path::new(&job.item.external_audio);
+        if !external.is_file() {
+            return Err(format!("外接音频不存在：{}", external.display()));
+        }
+        if !has_audio_stream(external) {
+            return Err(format!("外接文件没有可读音轨：{}", external.display()));
+        }
+    }
+    if matches!(container.as_str(), "m4a" | "wav")
+        && job.item.audio_tracks == 0
+        && !has_external_audio
+    {
+        return Err(format!(
+            "“{}”没有音轨，不能导出为 {}",
+            job.item.file_name,
+            container.to_uppercase()
+        ));
+    }
+    if job.item.export_alpha_mask {
+        if job.item.media_kind == "audio" || !job.item.has_alpha {
+            return Err(format!("“{}”没有可导出的 Alpha 通道", job.item.file_name));
+        }
+        if !matches!(
+            container.as_str(),
+            "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v"
+        ) {
+            return Err(format!(
+                "Alpha 遮罩只能使用视频封装，当前为 {}",
+                container.to_uppercase()
+            ));
+        }
+    }
+    if job.item.media_kind == "audio"
+        && job.item.audio_visual == "timecode"
+        && !filter_available("drawtext")
+    {
+        return Err(
+            "当前 FFmpeg 不包含 drawtext 滤镜，无法生成音频时间码画面；请选择纯黑或纯白画面".into(),
+        );
     }
     if container == "webm" && job.preset.codec != "av1" {
         return Err(format!(
@@ -862,13 +1053,21 @@ fn validate_job(job: &EncodeJob) -> Result<(), String> {
 }
 
 fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
+    if item.media_kind == "audio" && matches!(output_extension(item, preset).as_str(), "wav") {
+        return (item.duration.max(1.0) * 3.0 * 48_000.0) as u64;
+    }
     if preset.hdr_mode == "dolby_vision" {
         return item.size_bytes;
     }
     if preset.codec == "prores" {
         return item.size_bytes.saturating_mul(2).max(64 * 1024 * 1024);
     }
-    let bits_per_second = target_bitrate(item, preset).saturating_add(320_000);
+    let audio_bits = if item.audio_tracks > 0 || !item.external_audio.trim().is_empty() {
+        320_000
+    } else {
+        0
+    };
+    let bits_per_second = target_bitrate(item, preset).saturating_add(audio_bits);
     ((bits_per_second as f64 * item.duration.max(1.0) / 8.0) * 1.10) as u64
 }
 
@@ -899,6 +1098,7 @@ fn emit_cancelled(app: &tauri::AppHandle, item_id: String) {
             output: None,
             ok: Some(false),
             message: None,
+            alpha_output: None,
         },
     );
 }
@@ -1035,6 +1235,10 @@ fn default_media_kind() -> String {
     "video".into()
 }
 
+fn default_audio_visual() -> String {
+    "timecode".into()
+}
+
 fn default_sequence_fps() -> f64 {
     30.0
 }
@@ -1091,36 +1295,407 @@ fn default_true() -> bool {
     true
 }
 
-fn presets_path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
-    let dir = app.path().app_config_dir()?;
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("presets.json"))
+fn executable_dir_path() -> Result<PathBuf, String> {
+    let executable =
+        std::env::current_exe().map_err(|error| format!("无法定位运行中的程序：{error}"))?;
+    executable
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "无法定位运行中的程序目录".into())
 }
 
-fn read_presets(path: &Path) -> std::io::Result<Vec<Preset>> {
+fn portable_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let exe_dir = executable_dir_path()?;
+    let config = exe_dir.join("config");
+    if config.exists() {
+        if !config.is_dir() {
+            return Err(format!("便携配置路径不是文件夹：{}", config.display()));
+        }
+    } else {
+        let legacy = app
+            .path()
+            .app_config_dir()
+            .map_err(|error| format!("无法读取旧版配置目录：{error}"))?;
+        initialize_portable_config(&config, &legacy, &exe_dir)
+            .map_err(|error| format!("无法创建便携配置目录 {}：{error}", config.display()))?;
+    }
+    Ok(config)
+}
+
+fn presets_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(portable_config_dir(app)?.join("presets.json"))
+}
+
+fn read_presets(path: &Path) -> io::Result<Vec<Preset>> {
     let text = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text).unwrap_or_else(|_| default_presets()))
 }
 
-fn write_presets(path: &Path, presets: &[Preset]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn read_preferences(path: &Path) -> io::Result<Option<AppPreferences>> {
+    if !path.is_file() {
+        return Ok(None);
     }
-    fs::write(path, serde_json::to_string_pretty(presets).unwrap())
+    let text = fs::read_to_string(path)?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn collect_video_files(paths: Vec<String>) -> Vec<PathBuf> {
+fn write_preferences(path: &Path, preferences: &AppPreferences) -> io::Result<()> {
+    write_json_atomic(path, preferences)
+}
+
+fn write_presets(path: &Path, presets: &[Preset]) -> io::Result<()> {
+    write_json_atomic(path, presets)
+}
+
+fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.json");
+    let temporary = parent.join(format!(".{file_name}.vsc-tmp-{}", Uuid::new_v4()));
+    let payload = serde_json::to_vec_pretty(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Err(error) = fs::write(&temporary, payload) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    replace_file_with_backup(path, &temporary, false)
+}
+
+fn replace_file_with_backup(
+    path: &Path,
+    temporary: &Path,
+    simulate_replacement_failure: bool,
+) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.json");
+    let primary = if simulate_replacement_failure {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "simulated replacement failure",
+        ))
+    } else {
+        fs::rename(temporary, path)
+    };
+    match primary {
+        Ok(()) => Ok(()),
+        Err(primary_error) if path.exists() => {
+            // Windows cannot rename over an existing file. Move the previous
+            // good value aside first, then restore it if the replacement fails.
+            let backup = parent.join(format!(".{file_name}.vsc-backup-{}", Uuid::new_v4()));
+            fs::rename(path, &backup).map_err(|backup_error| {
+                let _ = fs::remove_file(&temporary);
+                io::Error::new(
+                    backup_error.kind(),
+                    format!("无法为配置替换创建备份（原始错误：{primary_error}）：{backup_error}"),
+                )
+            })?;
+            let replacement = if simulate_replacement_failure {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated replacement failure",
+                ))
+            } else {
+                fs::rename(temporary, path)
+            };
+            match replacement {
+                Ok(()) => {
+                    let _ = fs::remove_file(&backup);
+                    Ok(())
+                }
+                Err(replacement_error) => {
+                    let _ = fs::remove_file(path);
+                    let restore_result = fs::rename(&backup, path);
+                    let _ = fs::remove_file(temporary);
+                    match restore_result {
+                        Ok(()) => Err(replacement_error),
+                        Err(restore_error) => Err(io::Error::new(
+                            restore_error.kind(),
+                            format!(
+                                "配置替换失败且无法恢复旧文件（替换：{replacement_error}；恢复：{restore_error}）"
+                            ),
+                        )),
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(error)
+        }
+    }
+}
+
+fn format_portable_write_error(path: &Path, error: io::Error) -> String {
+    format!("无法写入便携配置 {}：{error}", path.display())
+}
+
+fn initialize_portable_config(
+    config_dir: &Path,
+    legacy_dir: &Path,
+    exe_dir: &Path,
+) -> io::Result<()> {
+    initialize_portable_config_internal(config_dir, legacy_dir, exe_dir, false)
+}
+
+fn initialize_portable_config_internal(
+    config_dir: &Path,
+    legacy_dir: &Path,
+    exe_dir: &Path,
+    simulate_failure_after_prepare: bool,
+) -> io::Result<()> {
+    if config_dir.exists() {
+        if !config_dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} 不是文件夹", config_dir.display()),
+            ));
+        }
+        return Ok(());
+    }
+
+    let parent = config_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(".config.vsc-staging-{}", Uuid::new_v4()));
+    fs::create_dir(&staging)?;
+
+    let result = (|| {
+        let legacy_luts = legacy_dir.join("luts");
+        let staging_luts = staging.join("luts");
+        if legacy_luts.is_dir() {
+            copy_directory_tree(&legacy_luts, &staging_luts)?;
+        }
+
+        let legacy_presets = legacy_dir.join("presets.json");
+        if legacy_presets.is_file() {
+            let mut presets = read_presets(&legacy_presets)?;
+            let final_luts = config_dir.join("luts");
+            rewrite_legacy_lut_references(&mut presets, legacy_dir, &final_luts, exe_dir);
+            write_presets(&staging.join("presets.json"), &presets)?;
+        }
+
+        let legacy_preferences = legacy_dir.join("preferences.json");
+        if legacy_preferences.is_file() {
+            fs::copy(&legacy_preferences, staging.join("preferences.json"))?;
+        }
+
+        if simulate_failure_after_prepare {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "simulated portable migration failure",
+            ));
+        }
+
+        if config_dir.exists() {
+            // A second process won the first-run race. Never replace its config.
+            return Ok(());
+        }
+        match fs::rename(&staging, config_dir) {
+            Ok(()) => Ok(()),
+            Err(_error) if config_dir.exists() => {
+                // A second process won the race between the check and rename.
+                // Keep its final config and let the caller continue with it.
+                let _ = fs::remove_dir_all(&staging);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    })();
+
+    match result {
+        Ok(()) => {
+            if staging.exists() {
+                let _ = fs::remove_dir_all(&staging);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+fn copy_directory_tree(source: &Path, target: &Path) -> io::Result<()> {
+    for entry in WalkDir::new(source) {
+        let entry = entry.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_legacy_lut_references(
+    presets: &mut [Preset],
+    legacy_dir: &Path,
+    portable_luts: &Path,
+    exe_dir: &Path,
+) {
+    let legacy_luts = legacy_dir.join("luts");
+    for preset in presets {
+        if preset.lut_name.trim().is_empty() {
+            continue;
+        }
+        if let Some(relative) = legacy_lut_relative_path(&preset.lut_name, legacy_dir, &legacy_luts)
+        {
+            preset.lut_name = normalize_lut_storage_path(exe_dir, &portable_luts.join(relative));
+        } else {
+            normalize_preset_lut_name(preset, exe_dir);
+        }
+    }
+}
+
+fn legacy_lut_relative_path(raw: &str, legacy_dir: &Path, legacy_luts: &Path) -> Option<PathBuf> {
+    let path = PathBuf::from(raw);
+    let candidates = if path.is_absolute() {
+        vec![path]
+    } else {
+        vec![
+            legacy_dir.join(&path),
+            legacy_luts.join(&path),
+            legacy_dir.join("luts").join(&path),
+        ]
+    };
+    candidates.into_iter().find_map(|candidate| {
+        relative_path_between(legacy_luts, &candidate).and_then(|relative| {
+            if relative
+                .components()
+                .any(|component| component == Component::ParentDir)
+            {
+                None
+            } else {
+                Some(relative)
+            }
+        })
+    })
+}
+
+fn normalize_preset_lut_names(presets: &mut [Preset], exe_dir: &Path) -> bool {
+    let mut changed = false;
+    for preset in presets {
+        changed |= normalize_preset_lut_name(preset, exe_dir);
+    }
+    changed
+}
+
+fn normalize_preset_lut_name(preset: &mut Preset, exe_dir: &Path) -> bool {
+    if preset.lut_name.trim().is_empty() {
+        return false;
+    }
+    let normalized = normalize_lut_storage_path(exe_dir, Path::new(&preset.lut_name));
+    if normalized == preset.lut_name {
+        false
+    } else {
+        preset.lut_name = normalized;
+        true
+    }
+}
+
+fn normalize_lut_storage_path(exe_dir: &Path, path: &Path) -> String {
+    if !path.is_absolute() {
+        return path.to_string_lossy().replace('\\', "/");
+    }
+    relative_path_between(exe_dir, path)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+fn resolve_stored_lut_path(exe_dir: &Path, stored: &str) -> PathBuf {
+    let path = PathBuf::from(stored);
+    if path.is_absolute() {
+        path
+    } else {
+        exe_dir.join(path)
+    }
+}
+
+fn relative_path_between(base: &Path, target: &Path) -> Option<PathBuf> {
+    let base_components: Vec<Component<'_>> = base.components().collect();
+    let target_components: Vec<Component<'_>> = target.components().collect();
+    if base_components.is_empty() || target_components.is_empty() {
+        return None;
+    }
+    let common = base_components
+        .iter()
+        .zip(target_components.iter())
+        .take_while(|(left, right)| path_components_equal(left, right))
+        .count();
+    if common == 0 {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for component in &base_components[common..] {
+        if !matches!(
+            component,
+            Component::CurDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            relative.push("..");
+        }
+    }
+    for component in &target_components[common..] {
+        if !matches!(
+            component,
+            Component::CurDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            relative.push(component.as_os_str());
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Some(relative)
+}
+
+fn path_components_equal(left: &Component<'_>, right: &Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn collect_media_files(paths: Vec<String>) -> Vec<PathBuf> {
+    collect_files(paths, is_media)
+}
+
+fn collect_files<F>(paths: Vec<String>, accepts: F) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
     let mut files = Vec::new();
     for raw in paths {
         let path = PathBuf::from(raw);
         if path.is_dir() {
             for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
                 let candidate = entry.path();
-                if candidate.is_file() && is_video(candidate) {
+                if candidate.is_file() && accepts(candidate) {
                     files.push(candidate.to_path_buf());
                 }
             }
-        } else if path.is_file() && is_video(&path) {
+        } else if path.is_file() && accepts(&path) {
             files.push(path);
         }
     }
@@ -1134,6 +1709,17 @@ fn is_video(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .map(|extension| VIDEO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_media(path: &Path) -> bool {
+    is_video(path) || is_audio(path)
 }
 
 fn is_lut(path: &Path) -> bool {
@@ -1200,18 +1786,29 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         })
         .cloned()
         .unwrap_or(Value::Null);
+    let audio = json["streams"]
+        .as_array()
+        .and_then(|streams| {
+            streams
+                .iter()
+                .find(|stream| stream["codec_type"] == "audio")
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let has_video = !video.is_null();
+    let primary_stream = if has_video { &video } else { &audio };
     let format = &json["format"];
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("video")
         .to_string();
-    let bit_rate = video["bit_rate"]
+    let bit_rate = primary_stream["bit_rate"]
         .as_str()
         .or_else(|| format["bit_rate"].as_str())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let duration = video["duration"]
+    let duration = primary_stream["duration"]
         .as_str()
         .or_else(|| format["duration"].as_str())
         .and_then(|value| value.parse::<f64>().ok())
@@ -1225,34 +1822,66 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         id: Uuid::new_v4().to_string(),
         source: path.to_string_lossy().to_string(),
         file_name,
-        codec: video["codec_name"]
+        codec: primary_stream["codec_name"]
             .as_str()
             .unwrap_or("unknown")
             .to_uppercase(),
-        width: video["width"].as_u64().unwrap_or(0) as u32,
-        height: video["height"].as_u64().unwrap_or(0) as u32,
-        fps: fps_label(
-            video["avg_frame_rate"]
-                .as_str()
-                .or_else(|| video["r_frame_rate"].as_str())
-                .unwrap_or(""),
-        ),
+        width: if has_video {
+            video["width"].as_u64().unwrap_or(0) as u32
+        } else {
+            1920
+        },
+        height: if has_video {
+            video["height"].as_u64().unwrap_or(0) as u32
+        } else {
+            1080
+        },
+        fps: if has_video {
+            fps_label(
+                video["avg_frame_rate"]
+                    .as_str()
+                    .or_else(|| video["r_frame_rate"].as_str())
+                    .unwrap_or(""),
+            )
+        } else {
+            "30 fps".into()
+        },
         bitrate: bit_rate,
         duration,
         size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
-        thumbnail: generate_thumbnail(path, duration),
-        has_alpha: detect_alpha_pixel_format(pixel_format),
-        is_panorama: detect_panorama(&json),
-        panorama_tagged: detect_panorama_tagged(&json),
-        bit_depth: detect_bit_depth(&video, pixel_format),
-        chroma: detect_chroma(pixel_format),
-        color_space: video["color_primaries"]
-            .as_str()
-            .or_else(|| video["color_space"].as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        color_transfer,
-        hdr_mode,
+        thumbnail: if has_video {
+            generate_thumbnail(path, duration)
+        } else {
+            String::new()
+        },
+        has_alpha: has_video && detect_alpha_pixel_format(pixel_format),
+        is_panorama: has_video && detect_panorama(&json),
+        panorama_tagged: has_video && detect_panorama_tagged(&json),
+        bit_depth: if has_video {
+            detect_bit_depth(&video, pixel_format)
+        } else {
+            0
+        },
+        chroma: if has_video {
+            detect_chroma(pixel_format)
+        } else {
+            "none".into()
+        },
+        color_space: if has_video {
+            video["color_primaries"]
+                .as_str()
+                .or_else(|| video["color_space"].as_str())
+                .unwrap_or("unknown")
+                .to_string()
+        } else {
+            "n/a".into()
+        },
+        color_transfer: if has_video {
+            color_transfer
+        } else {
+            "n/a".into()
+        },
+        hdr_mode: if has_video { hdr_mode } else { "sdr".into() },
         audio_tracks: streams
             .iter()
             .filter(|stream| stream["codec_type"] == "audio")
@@ -1266,14 +1895,39 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         output: String::new(),
         status: "等待中".into(),
         progress: 0,
-        media_kind: default_media_kind(),
+        media_kind: if has_video {
+            default_media_kind()
+        } else {
+            "audio".into()
+        },
         sequence_pattern: String::new(),
         sequence_start_number: 0,
         sequence_frame_count: 0,
         sequence_fps: default_sequence_fps(),
         sequence_pixel_aspect: default_pixel_aspect(),
         sequence_frames: Vec::new(),
+        export_alpha_mask: false,
+        alpha_output: String::new(),
+        external_audio: String::new(),
+        audio_visual: default_audio_visual(),
     })
+}
+
+fn has_audio_stream(path: &Path) -> bool {
+    let output = command_with_hidden_window(resolve_tool("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output();
+    matches!(output, Ok(output) if output.status.success() && !output.stdout.is_empty())
 }
 
 fn generate_thumbnail(path: &Path, duration: f64) -> String {
@@ -1346,6 +2000,9 @@ fn encode_job(
         &temporary_output,
         sequence_list.as_deref(),
     );
+    let main_phase = EncodePhase::Main {
+        reserve_alpha: job.item.export_alpha_mask,
+    };
     let _ = app.emit(
         "encode-progress",
         EncodeProgress {
@@ -1355,10 +2012,19 @@ fn encode_job(
             output: Some(output.to_string_lossy().to_string()),
             ok: None,
             message: Some(format!("ffmpeg {}", shell_join(&args))),
+            alpha_output: None,
         },
     );
 
-    if let Err(first_error) = run_ffmpeg(app, &item_id, &job.item, &args, &output, cancel) {
+    if let Err(first_error) = run_ffmpeg(
+        app,
+        &item_id,
+        &job.item,
+        &args,
+        &output,
+        cancel,
+        &main_phase,
+    ) {
         if first_error == CANCELLED_ERROR {
             let _ = fs::remove_file(&temporary_output);
             emit_cancelled(app, item_id);
@@ -1385,9 +2051,18 @@ fn encode_job(
                     output: Some(output.to_string_lossy().to_string()),
                     ok: None,
                     message: Some(first_error.clone()),
+                    alpha_output: None,
                 },
             );
-            if let Err(error) = run_ffmpeg(app, &item_id, &job.item, &cpu_args, &output, cancel) {
+            if let Err(error) = run_ffmpeg(
+                app,
+                &item_id,
+                &job.item,
+                &cpu_args,
+                &output,
+                cancel,
+                &main_phase,
+            ) {
                 let _ = fs::remove_file(&temporary_output);
                 if error == CANCELLED_ERROR {
                     emit_cancelled(app, item_id);
@@ -1432,6 +2107,59 @@ fn encode_job(
         return Err((item_id, format!("无法完成输出文件：{error}")));
     }
 
+    let alpha_output = if job.item.export_alpha_mask {
+        let alpha_output = build_alpha_output_path(&output);
+        let alpha_temporary = temporary_output_path(&alpha_output);
+        let alpha_args = build_alpha_ffmpeg_args_with_sequence(
+            &job.item,
+            &job.preset,
+            &alpha_temporary,
+            sequence_list.as_deref(),
+        );
+        let alpha_phase = EncodePhase::Alpha {
+            main_output: output.to_string_lossy().to_string(),
+            alpha_output: alpha_output.to_string_lossy().to_string(),
+        };
+        let _ = app.emit(
+            "encode-progress",
+            EncodeProgress {
+                item_id: item_id.clone(),
+                progress: phase_progress(0, &alpha_phase),
+                status: phase_status(0, &alpha_phase),
+                output: Some(output.to_string_lossy().to_string()),
+                ok: None,
+                message: Some(format!("alpha ffmpeg {}", shell_join(&alpha_args))),
+                alpha_output: Some(alpha_output.to_string_lossy().to_string()),
+            },
+        );
+        let alpha_result = run_ffmpeg(
+            app,
+            &item_id,
+            &job.item,
+            &alpha_args,
+            &alpha_temporary,
+            cancel,
+            &alpha_phase,
+        );
+        if let Err(error) = alpha_result {
+            let _ = fs::remove_file(&alpha_temporary);
+            let _ = fs::remove_file(&output);
+            if error == CANCELLED_ERROR {
+                emit_cancelled(app, item_id);
+                return Ok(());
+            }
+            return Err((item_id, format!("Alpha 遮罩生成失败：{error}")));
+        }
+        if let Err(error) = fs::rename(&alpha_temporary, &alpha_output) {
+            let _ = fs::remove_file(&alpha_temporary);
+            let _ = fs::remove_file(&output);
+            return Err((item_id, format!("无法完成 Alpha 输出文件：{error}")));
+        }
+        Some(alpha_output)
+    } else {
+        None
+    };
+
     if job.preset.keep_times && timestamp_error.is_none() {
         timestamp_error = verify_preserved_times(&source, &output).err();
     }
@@ -1448,6 +2176,7 @@ fn encode_job(
                 message: Some(format!(
                     "视频已编码，但无法同时恢复源文件的创建日期和修改时间：{error}"
                 )),
+                alpha_output: None,
             },
         );
         return Ok(());
@@ -1468,6 +2197,7 @@ fn encode_job(
                 .preset
                 .keep_times
                 .then(|| "输出完成；创建日期和修改时间已恢复为源视频时间".into()),
+            alpha_output: alpha_output.map(|path| path.to_string_lossy().to_string()),
         },
     );
     Ok(())
@@ -1480,6 +2210,7 @@ fn run_ffmpeg(
     args: &[String],
     output: &Path,
     cancel: &Arc<AtomicBool>,
+    phase: &EncodePhase,
 ) -> Result<(), String> {
     let mut child = command_with_hidden_window(resolve_tool("ffmpeg"))
         .args(args)
@@ -1504,15 +2235,17 @@ fn run_ffmpeg(
                 }
             }
             if let Some(progress) = parse_progress(&line, item.duration) {
+                let (reported_output, alpha_output) = phase_output_paths(output, phase);
                 let _ = app.emit(
                     "encode-progress",
                     EncodeProgress {
                         item_id: item_id.to_string(),
-                        progress,
-                        status: format!("编码中 {progress}%"),
-                        output: Some(output.to_string_lossy().to_string()),
+                        progress: phase_progress(progress, phase),
+                        status: phase_status(progress, phase),
+                        output: Some(reported_output),
                         ok: None,
                         message: None,
+                        alpha_output,
                     },
                 );
             }
@@ -1571,7 +2304,7 @@ fn output_extension(item: &QueueItem, preset: &Preset) -> String {
     if preset.output_container != "source" {
         return preset.output_container.clone();
     }
-    if item.media_kind == "sequence" {
+    if matches!(item.media_kind.as_str(), "sequence" | "audio") {
         return "mp4".into();
     }
     Path::new(&item.source)
@@ -1584,6 +2317,19 @@ fn output_extension(item: &QueueItem, preset: &Preset) -> String {
             "mp4"
         })
         .to_ascii_lowercase()
+}
+
+fn build_alpha_output_path(main_output: &Path) -> PathBuf {
+    let parent = main_output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = main_output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let extension = main_output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
+    unique_output_path(&parent.join(format!("{stem}_alpha.{extension}")))
 }
 
 fn is_isobmff_path(path: &Path) -> bool {
@@ -1659,6 +2405,9 @@ fn build_ffmpeg_args_with_sequence(
     output: &Path,
     sequence_list: Option<&Path>,
 ) -> Vec<String> {
+    if item.media_kind == "audio" || !item.external_audio.trim().is_empty() {
+        return build_ffmpeg_args_with_audio(item, preset, output, sequence_list);
+    }
     let encoder = video_encoder(item, preset);
     let dolby_vision_copy = preset.hdr_mode == "dolby_vision" && !item.has_alpha;
     let mut args = vec![
@@ -1683,17 +2432,30 @@ fn build_ffmpeg_args_with_sequence(
         args.extend(["-i".into(), item.source.clone()]);
     }
 
-    if output_extension(item, preset) == "m4a" {
+    if matches!(output_extension(item, preset).as_str(), "m4a" | "wav") {
         args.extend([
             "-map".into(),
             "0:a:0?".into(),
             "-vn".into(),
             "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "320k".into(),
+            if output_extension(item, preset) == "wav" {
+                "pcm_s24le".into()
+            } else {
+                "aac".into()
+            },
+            if output_extension(item, preset) == "wav" {
+                String::new()
+            } else {
+                "-b:a".into()
+            },
+            if output_extension(item, preset) == "wav" {
+                String::new()
+            } else {
+                "320k".into()
+            },
             output.to_string_lossy().to_string(),
         ]);
+        args.retain(|arg| !arg.is_empty());
         return args;
     }
 
@@ -1778,7 +2540,268 @@ fn build_ffmpeg_args_with_sequence(
     args
 }
 
+fn build_ffmpeg_args_with_audio(
+    item: &QueueItem,
+    preset: &Preset,
+    output: &Path,
+    sequence_list: Option<&Path>,
+) -> Vec<String> {
+    let extension = output_extension(item, preset);
+    let encoder = video_encoder(item, preset);
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-progress".into(),
+        "pipe:2".into(),
+        "-nostats".into(),
+    ];
+
+    if matches!(extension.as_str(), "m4a" | "wav") {
+        if let Some(list) = sequence_list {
+            args.extend([
+                "-f".into(),
+                "concat".into(),
+                "-safe".into(),
+                "0".into(),
+                "-i".into(),
+                list.to_string_lossy().to_string(),
+            ]);
+        } else {
+            args.extend(["-i".into(), item.source.clone()]);
+        }
+        let audio_index = if item.external_audio.trim().is_empty() {
+            0
+        } else {
+            args.extend(["-i".into(), item.external_audio.clone()]);
+            1
+        };
+        args.extend([
+            "-map".into(),
+            format!("{audio_index}:a:0?"),
+            "-vn".into(),
+            "-c:a".into(),
+            if extension == "wav" {
+                "pcm_s24le".into()
+            } else {
+                "aac".into()
+            },
+        ]);
+        if extension == "m4a" {
+            args.extend(["-b:a".into(), "320k".into()]);
+        }
+        args.push(output.to_string_lossy().to_string());
+        return args;
+    }
+
+    let color = match item.audio_visual.as_str() {
+        "white" => "white",
+        _ => "black",
+    };
+    if item.media_kind == "audio" {
+        args.extend([
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            format!("color=c={color}:s=1920x1080:r=30"),
+            "-i".into(),
+            if item.external_audio.trim().is_empty() {
+                item.source.clone()
+            } else {
+                item.external_audio.clone()
+            },
+        ]);
+    } else {
+        if let Some(list) = sequence_list {
+            args.extend([
+                "-f".into(),
+                "concat".into(),
+                "-safe".into(),
+                "0".into(),
+                "-i".into(),
+                list.to_string_lossy().to_string(),
+                "-r".into(),
+                format!("{:.6}", item.sequence_fps.max(0.001)),
+            ]);
+        } else {
+            args.extend(["-i".into(), item.source.clone()]);
+        }
+        args.extend(["-i".into(), item.external_audio.clone()]);
+    }
+
+    args.extend([
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "1:a:0?".into(),
+        "-map_metadata".into(),
+        if item.media_kind == "audio" {
+            "-1".into()
+        } else {
+            "0".into()
+        },
+        "-c:v".into(),
+        encoder.clone(),
+    ]);
+    if item.media_kind == "audio" {
+        if item.audio_visual == "timecode" {
+            args.extend([
+                "-vf".into(),
+                "drawtext=text='%{pts\\:hms}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2".into(),
+            ]);
+        }
+    } else if let Some(filter) = video_filter(item, preset) {
+        args.extend(["-vf".into(), filter]);
+    }
+    if preset.codec == "prores" {
+        args.extend([
+            "-profile:v".into(),
+            "1".into(),
+            "-pix_fmt".into(),
+            "yuv422p10le".into(),
+        ]);
+    } else {
+        args.extend([
+            "-b:v".into(),
+            target_bitrate(item, preset).to_string(),
+            "-pix_fmt".into(),
+            if item.media_kind == "audio" {
+                "yuv420p".into()
+            } else {
+                pixel_format(item, preset)
+            },
+        ]);
+    }
+    match encoder.as_str() {
+        "libx265" | "libx264" => args.extend(["-preset".into(), "medium".into()]),
+        "libaom-av1" => args.extend(["-cpu-used".into(), "6".into(), "-row-mt".into(), "1".into()]),
+        _ => {}
+    }
+    if item.media_kind != "audio" {
+        add_color_output_args(&mut args, item, preset, &encoder);
+    }
+    let audio_codec = if extension == "webm" {
+        "libopus"
+    } else {
+        "aac"
+    };
+    args.extend([
+        "-c:a".into(),
+        audio_codec.into(),
+        "-b:a".into(),
+        "320k".into(),
+        "-af".into(),
+        "apad".into(),
+        "-t".into(),
+        format!("{:.6}", item.duration.max(0.001)),
+    ]);
+    if matches!(extension.as_str(), "mp4" | "mov" | "m4v") {
+        args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
+    }
+    args.push(output.to_string_lossy().to_string());
+    args
+}
+
+fn build_alpha_ffmpeg_args_with_sequence(
+    item: &QueueItem,
+    preset: &Preset,
+    output: &Path,
+    sequence_list: Option<&Path>,
+) -> Vec<String> {
+    let encoder = video_encoder(item, preset);
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-progress".into(),
+        "pipe:2".into(),
+        "-nostats".into(),
+    ];
+    if let Some(list) = sequence_list {
+        args.extend([
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            list.to_string_lossy().to_string(),
+            "-r".into(),
+            format!("{:.6}", item.sequence_fps.max(0.001)),
+        ]);
+    } else {
+        args.extend(["-i".into(), item.source.clone()]);
+    }
+    let mut filters = vec!["alphaextract".into()];
+    match preset.resolution_mode.as_str() {
+        "short_edge" => {
+            let edge = preset.short_edge.max(120);
+            filters.push(format!(
+                "scale=if(gte(iw\\,ih)\\,-2\\,{edge}):if(gte(iw\\,ih)\\,{edge}\\,-2)"
+            ));
+        }
+        "scale_percent" => {
+            let ratio = (preset.scale_percent.clamp(10, 90) as f64) / 100.0;
+            filters.push(format!("scale=trunc(iw*{ratio}/2)*2:trunc(ih*{ratio}/2)*2"));
+        }
+        "custom" => {
+            let width = preset.custom_width.max(2) / 2 * 2;
+            let height = preset.custom_height.max(2) / 2 * 2;
+            filters.push(format!(
+                "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            ));
+        }
+        _ => {}
+    }
+    filters.push("format=gray,format=yuv420p".into());
+    args.extend([
+        "-map".into(),
+        "0:v:0".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+        "-an".into(),
+        "-vf".into(),
+        filters.join(","),
+        "-c:v".into(),
+        encoder.clone(),
+    ]);
+    if preset.codec == "prores" {
+        args.extend([
+            "-profile:v".into(),
+            "1".into(),
+            "-pix_fmt".into(),
+            "yuv422p10le".into(),
+        ]);
+    } else {
+        args.extend([
+            "-b:v".into(),
+            (target_bitrate(item, preset)
+                .saturating_mul(30)
+                .saturating_div(100))
+            .max(100_000)
+            .to_string(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ]);
+    }
+    match encoder.as_str() {
+        "libx265" | "libx264" => args.extend(["-preset".into(), "medium".into()]),
+        "libaom-av1" => args.extend(["-cpu-used".into(), "6".into(), "-row-mt".into(), "1".into()]),
+        _ => {}
+    }
+    if matches!(
+        output.extension().and_then(|value| value.to_str()),
+        Some("mp4" | "mov" | "m4v")
+    ) {
+        args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
+    }
+    args.push(output.to_string_lossy().to_string());
+    args
+}
+
 fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
+    let exe_dir = executable_dir_path().unwrap_or_else(|_| PathBuf::from("."));
+    video_filter_with_exe_dir(item, preset, &exe_dir)
+}
+
+fn video_filter_with_exe_dir(item: &QueueItem, preset: &Preset, exe_dir: &Path) -> Option<String> {
     let mut filters = Vec::new();
     if item.media_kind == "sequence" {
         filters.push(format!("setpts=N/({:.6}*TB)", item.sequence_fps.max(0.001)));
@@ -1816,9 +2839,12 @@ fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
         filters.push(color_filter);
     }
     if preset.lut_enabled {
-        let lut = PathBuf::from(&preset.lut_name);
+        let lut = resolve_stored_lut_path(exe_dir, &preset.lut_name);
         if lut.exists() {
-            let lut_filter = format!("lut3d=file='{}'", escape_filter_path(&preset.lut_name));
+            let lut_filter = format!(
+                "lut3d=file='{}'",
+                escape_filter_path(&lut.to_string_lossy())
+            );
             let strength = preset.lut_intensity.min(100);
             if strength >= 100 {
                 filters.push(lut_filter);
@@ -2576,6 +3602,248 @@ fn shell_join(args: &[String]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn portable_config_migration_copies_nested_luts_and_rewrites_references() {
+        let root = std::env::temp_dir().join(format!("vsc-portable-migrate-{}", Uuid::new_v4()));
+        let exe_dir = root.join("app");
+        let legacy_dir = root.join("legacy");
+        let legacy_lut = legacy_dir.join("luts").join("nested").join("film.cube");
+        fs::create_dir_all(legacy_lut.parent().unwrap()).unwrap();
+        fs::write(&legacy_lut, "TITLE \"Film\"").unwrap();
+        let mut preset = default_presets().into_iter().next().unwrap();
+        preset.lut_enabled = true;
+        preset.lut_name = legacy_lut.to_string_lossy().to_string();
+        write_presets(&legacy_dir.join("presets.json"), &[preset]).unwrap();
+        let mut legacy_preferences = AppPreferences::default();
+        legacy_preferences.default_output_dir = "legacy-output".into();
+        write_preferences(&legacy_dir.join("preferences.json"), &legacy_preferences).unwrap();
+
+        initialize_portable_config(&exe_dir.join("config"), &legacy_dir, &exe_dir).unwrap();
+
+        let copied = exe_dir
+            .join("config")
+            .join("luts")
+            .join("nested")
+            .join("film.cube");
+        assert!(copied.is_file());
+        let migrated = read_presets(&exe_dir.join("config").join("presets.json")).unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].lut_name, "config/luts/nested/film.cube");
+        assert_eq!(
+            resolve_stored_lut_path(&exe_dir, &migrated[0].lut_name),
+            copied
+        );
+        assert_eq!(
+            read_preferences(&exe_dir.join("config").join("preferences.json")).unwrap(),
+            Some(legacy_preferences)
+        );
+        assert!(
+            legacy_lut.is_file(),
+            "migration must not delete legacy data"
+        );
+        let staging_leftovers = fs::read_dir(&exe_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.vsc-staging-")
+            })
+            .count();
+        assert_eq!(
+            staging_leftovers, 0,
+            "successful migration must clean staging"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_portable_config_wins_without_overwriting_legacy_data() {
+        let root = std::env::temp_dir().join(format!("vsc-portable-existing-{}", Uuid::new_v4()));
+        let exe_dir = root.join("app");
+        let portable = exe_dir.join("config");
+        let legacy_dir = root.join("legacy");
+        fs::create_dir_all(&portable).unwrap();
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let mut portable_preset = default_presets().into_iter().next().unwrap();
+        portable_preset.name = "便携版本".into();
+        let mut legacy_preset = portable_preset.clone();
+        legacy_preset.name = "旧版本".into();
+        write_presets(&portable.join("presets.json"), &[portable_preset]).unwrap();
+        write_presets(&legacy_dir.join("presets.json"), &[legacy_preset]).unwrap();
+
+        initialize_portable_config(&portable, &legacy_dir, &exe_dir).unwrap();
+        let loaded = read_presets(&portable.join("presets.json")).unwrap();
+        assert_eq!(loaded[0].name, "便携版本");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_portable_migration_removes_staging_and_can_retry() {
+        let root = std::env::temp_dir().join(format!("vsc-portable-failure-{}", Uuid::new_v4()));
+        let exe_dir = root.join("app");
+        let config = exe_dir.join("config");
+        let legacy_dir = root.join("legacy");
+        let legacy_lut = legacy_dir.join("luts").join("nested").join("film.cube");
+        fs::create_dir_all(legacy_lut.parent().unwrap()).unwrap();
+        fs::write(&legacy_lut, "TITLE \"Film\"").unwrap();
+        write_presets(&legacy_dir.join("presets.json"), &default_presets()).unwrap();
+
+        let failed = initialize_portable_config_internal(&config, &legacy_dir, &exe_dir, true);
+        assert!(failed.is_err());
+        assert!(
+            !config.exists(),
+            "failed migration must not publish final config"
+        );
+        let staging_leftovers = fs::read_dir(&exe_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.vsc-staging-")
+            })
+            .count();
+        assert_eq!(staging_leftovers, 0, "failed migration must clean staging");
+
+        initialize_portable_config(&config, &legacy_dir, &exe_dir).unwrap();
+        assert!(
+            config.is_dir(),
+            "migration should be retryable after failure"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_replacement_restores_old_config_after_simulated_failure() {
+        let root = std::env::temp_dir().join(format!("vsc-atomic-config-{}", Uuid::new_v4()));
+        let path = root.join("preferences.json");
+        let temporary = root.join(".preferences.json.vsc-tmp-test");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, "old config").unwrap();
+        fs::write(&temporary, "new config").unwrap();
+
+        let result = replace_file_with_backup(&path, &temporary, true);
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old config");
+        assert!(!temporary.exists());
+        let backups = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("vsc-backup-"))
+            .count();
+        assert_eq!(backups, 0, "restored replacement must clean backup");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preference_fallback_is_persisted_then_portable_value_wins() {
+        let root =
+            std::env::temp_dir().join(format!("vsc-portable-preferences-{}", Uuid::new_v4()));
+        let path = root.join("config").join("preferences.json");
+        assert_eq!(read_preferences(&path).unwrap(), None);
+
+        let fallback = AppPreferences::default();
+        write_preferences(&path, &fallback).unwrap();
+        assert_eq!(read_preferences(&path).unwrap(), Some(fallback.clone()));
+
+        let mut portable = fallback;
+        portable.default_output_dir = "D:/Portable Output".into();
+        portable.default_sequence_fps = 23.976;
+        write_preferences(&path, &portable).unwrap();
+        assert_eq!(read_preferences(&path).unwrap(), Some(portable));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lut_storage_is_relative_and_resolves_against_executable_dir() {
+        let root = std::env::temp_dir().join(format!("vsc-portable-lut-{}", Uuid::new_v4()));
+        let exe_dir = root.join("app");
+        let target = exe_dir.join("config").join("luts").join("grade.cube");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "TITLE \"Grade\"").unwrap();
+
+        let stored = normalize_lut_storage_path(&exe_dir, &target);
+        assert_eq!(stored, "config/luts/grade.cube");
+        assert_eq!(resolve_stored_lut_path(&exe_dir, &stored), target);
+
+        #[cfg(windows)]
+        {
+            let other_drive = PathBuf::from(r"D:\lut\grade.cube");
+            assert_eq!(
+                normalize_lut_storage_path(Path::new(r"C:\app"), &other_drive),
+                r"D:\lut\grade.cube"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relative_lut_filter_resolves_imported_file_for_encoding() {
+        let root = std::env::temp_dir().join(format!("vsc-portable-lut-filter-{}", Uuid::new_v4()));
+        let exe_dir = root.join("app");
+        let lut_path = exe_dir.join("config").join("luts").join("imported.cube");
+        fs::create_dir_all(lut_path.parent().unwrap()).unwrap();
+        fs::write(&lut_path, "TITLE \"Imported\"").unwrap();
+        let stored = normalize_lut_storage_path(&exe_dir, &lut_path);
+        let mut preset = preset_with_defaults("lut-relative", "LUT", "h264", "_lut");
+        preset.lut_enabled = true;
+        preset.lut_name = stored;
+        let item = QueueItem {
+            id: "lut-item".into(),
+            source: "input.mp4".into(),
+            file_name: "input.mp4".into(),
+            codec: "H264".into(),
+            width: 320,
+            height: 180,
+            fps: "24 fps".into(),
+            bitrate: 1_000_000,
+            duration: 1.0,
+            size_bytes: 100,
+            thumbnail: String::new(),
+            has_alpha: false,
+            is_panorama: false,
+            panorama_tagged: false,
+            bit_depth: 8,
+            chroma: "420".into(),
+            color_space: "bt709".into(),
+            color_transfer: "bt709".into(),
+            hdr_mode: "sdr".into(),
+            audio_tracks: 0,
+            subtitle_tracks: 0,
+            preset_id: preset.id.clone(),
+            selected: true,
+            output: String::new(),
+            status: "就绪".into(),
+            progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
+        };
+        let filter = video_filter_with_exe_dir(&item, &preset, &exe_dir).unwrap();
+        assert!(filter.contains("lut3d=file='"));
+        assert!(filter.contains("config/luts/imported.cube"));
+        assert!(resolve_stored_lut_path(&exe_dir, &preset.lut_name).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn preserve_times_restores_creation_and_modification_dates() {
@@ -2717,6 +3985,10 @@ mod tests {
             sequence_fps: default_sequence_fps(),
             sequence_pixel_aspect: default_pixel_aspect(),
             sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
         };
 
         let mut av1 = preset_with_defaults("av1", "AV1", "av1", "_av1");
@@ -2862,6 +4134,10 @@ mod tests {
             sequence_fps: default_sequence_fps(),
             sequence_pixel_aspect: default_pixel_aspect(),
             sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
         };
         let mut preset = preset_with_defaults("alpha", "Alpha", "h264", "_alpha");
         for (background, expected) in [("checkerboard", "192"), ("black", "0"), ("white", "255")] {
@@ -2983,27 +4259,58 @@ mod tests {
     }
 
     #[test]
-    fn collect_video_files_recurses_filters_and_sorts() {
+    fn collect_media_files_recurses_includes_audio_and_filters_unsupported() {
         let root = std::env::temp_dir().join(format!("vsc-import-{}", Uuid::new_v4()));
         let nested = root.join("nested");
         fs::create_dir_all(&nested).unwrap();
         let a = root.join("A.MP4");
         let b = nested.join("b.mov");
+        let audio = nested.join("c.WAV");
+        let image = nested.join("frame.png");
         let note = nested.join("note.txt");
         fs::write(&a, "").unwrap();
         fs::write(&b, "").unwrap();
+        fs::write(&audio, "").unwrap();
+        fs::write(&image, "").unwrap();
         fs::write(&note, "").unwrap();
 
-        let files = collect_video_files(vec![
+        let files = collect_media_files(vec![
             root.to_string_lossy().to_string(),
             a.to_string_lossy().to_string(),
         ]);
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert!(files.contains(&a));
         assert!(files.contains(&b));
+        assert!(files.contains(&audio));
+        assert!(!files.contains(&image));
         assert!(!files.contains(&note));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn alpha_progress_reserves_final_range_and_keeps_main_output_path() {
+        let main_phase = EncodePhase::Main {
+            reserve_alpha: true,
+        };
+        assert_eq!(phase_progress(0, &main_phase), 0);
+        assert_eq!(phase_progress(99, &main_phase), 89);
+
+        let alpha_phase = EncodePhase::Alpha {
+            main_output: "D:/encoded/main.mp4".into(),
+            alpha_output: "D:/encoded/main_alpha.mp4".into(),
+        };
+        let samples = [0, 1, 25, 50, 99];
+        let mapped: Vec<u8> = samples
+            .iter()
+            .map(|value| phase_progress(*value, &alpha_phase))
+            .collect();
+        assert_eq!(mapped, vec![90, 91, 93, 95, 99]);
+        assert!(mapped.windows(2).all(|window| window[0] <= window[1]));
+        assert_eq!(phase_status(50, &alpha_phase), "生成 Alpha 遮罩 95%");
+        let paths = phase_output_paths(Path::new("D:/encoded/.main.partial.mp4"), &alpha_phase);
+        assert_eq!(paths.0, "D:/encoded/main.mp4");
+        assert_eq!(paths.1.as_deref(), Some("D:/encoded/main_alpha.mp4"));
     }
 
     #[test]
@@ -3138,6 +4445,10 @@ mod tests {
             sequence_pixel_aspect: default_pixel_aspect(),
             has_alpha: false,
             sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
         };
         let mut preset = preset_with_defaults("preset", "Preset", "h265", "_压缩");
         preset.prefix = "交付_".into();
@@ -3251,7 +4562,7 @@ mod tests {
 
         let error = probe_paths_impl(vec![root.to_string_lossy().to_string()], "preset".into())
             .unwrap_err();
-        assert!(error.contains("没有找到支持的视频文件"));
+        assert!(error.contains("没有找到支持的媒体文件"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3300,6 +4611,10 @@ mod tests {
             sequence_pixel_aspect: default_pixel_aspect(),
             has_alpha: false,
             sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
         };
         preflight_jobs(&[EncodeJob { item, preset }]).unwrap();
         assert!(output_dir.is_dir());
@@ -3467,6 +4782,315 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn audio_probe_generates_video_and_wav_outputs() {
+        let root = std::env::temp_dir().join(format!("vsc-audio-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("tone.wav");
+        let source_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "0.45",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(source_status.success(), "failed to create audio source");
+
+        let item = probe_video(&source, "audio-preset").unwrap();
+        assert_eq!(item.media_kind, "audio");
+        assert_eq!((item.width, item.height), (1920, 1080));
+        assert_eq!(item.fps, "30 fps");
+        assert_eq!(item.audio_tracks, 1);
+        assert!(item.duration > 0.3);
+
+        let mut preset = preset_with_defaults("audio-preset", "Audio", "h264", "_video");
+        preset.hardware = "cpu".into();
+        preset.output_mode = "single_folder".into();
+        preset.output_dir = root.join("video").to_string_lossy().to_string();
+        fs::create_dir_all(&preset.output_dir).unwrap();
+        let video_output = build_output_path(&item, &preset);
+        let timecode_args = build_ffmpeg_args(&item, &preset, &video_output);
+        assert!(timecode_args.iter().any(|arg| arg.contains("drawtext")));
+        let video_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(timecode_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(video_status.success(), "audio to video encode failed");
+        let streams = probe_stream_types(&video_output);
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "video"));
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+        let mut black = item.clone();
+        black.audio_visual = "black".into();
+        assert!(build_ffmpeg_args(&black, &preset, Path::new("black.mp4"))
+            .windows(2)
+            .any(|pair| pair[0] == "-i" && pair[1].contains("color=c=black")));
+        let mut white = item.clone();
+        white.audio_visual = "white".into();
+        assert!(build_ffmpeg_args(&white, &preset, Path::new("white.mp4"))
+            .iter()
+            .any(|arg| arg.contains("color=c=white")));
+
+        let mut wav_preset = preset.clone();
+        wav_preset.id = "wav".into();
+        wav_preset.output_container = "wav".into();
+        wav_preset.output_dir = root.join("wav").to_string_lossy().to_string();
+        fs::create_dir_all(&wav_preset.output_dir).unwrap();
+        let wav_output = build_output_path(&item, &wav_preset);
+        let wav_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(build_ffmpeg_args(&item, &wav_preset, &wav_output))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(wav_status.success(), "audio WAV encode failed");
+        let wav_streams = probe_stream_types(&wav_output);
+        assert_eq!(wav_streams.len(), 1);
+        assert_eq!(wav_streams[0]["codec_type"], "audio");
+        assert_eq!(wav_streams[0]["codec_name"], "pcm_s24le");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn alpha_mask_args_encode_real_video_without_audio() {
+        let root = std::env::temp_dir().join(format!("vsc-alpha-real-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("alpha.png");
+        let source_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red@0.0:s=64x36:r=1",
+                "-vf",
+                "format=rgba",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "rgba",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(source_status.success(), "failed to create alpha PNG");
+        let item = probe_video(&source, "alpha-preset").unwrap();
+        assert!(item.has_alpha, "PNG source did not preserve Alpha");
+
+        let tga_source = root.join("alpha.tga");
+        let tga_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red@0.0:s=64x36:r=1",
+                "-vf",
+                "format=rgba",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "rgba",
+            ])
+            .arg(&tga_source)
+            .status()
+            .unwrap();
+        assert!(tga_status.success(), "failed to create alpha TGA");
+        let tga_item = probe_video(&tga_source, "alpha-tga").unwrap();
+        assert!(tga_item.has_alpha, "TGA source did not preserve Alpha");
+
+        let mut preset = preset_with_defaults("alpha-preset", "Alpha", "h264", "_main");
+        preset.hardware = "cpu".into();
+        preset.output_container = "mp4".into();
+        preset.bitrate_mode = "target_mbps".into();
+        preset.target_bitrate_mbps = 1.0;
+        preset.output_mode = "single_folder".into();
+        preset.output_dir = root.join("encoded").to_string_lossy().to_string();
+        fs::create_dir_all(&preset.output_dir).unwrap();
+        let main_output = build_output_path(&item, &preset);
+        let alpha_output = build_alpha_output_path(&main_output);
+        let args = build_alpha_ffmpeg_args_with_sequence(&item, &preset, &alpha_output, None);
+        assert!(args.iter().any(|arg| arg.contains("alphaextract")));
+        let bitrate_index = args.iter().position(|arg| arg == "-b:v").unwrap();
+        assert_eq!(args[bitrate_index + 1], "300000");
+        let status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "Alpha mask encode failed");
+        let streams = probe_stream_types(&alpha_output);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["codec_type"], "video");
+        assert_eq!(streams[0]["width"], 64);
+        assert_eq!(streams[0]["height"], 36);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prores4444_alpha_source_exports_video_only_matte() {
+        let root = std::env::temp_dir().join(format!("vsc-prores-alpha-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("prores4444-alpha.mov");
+        let source_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red@0.0:s=64x36:r=2",
+                "-t",
+                "0.5",
+                "-vf",
+                "format=yuva444p10le",
+                "-c:v",
+                "prores_ks",
+                "-profile:v",
+                "4",
+                "-pix_fmt",
+                "yuva444p10le",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(
+            source_status.success(),
+            "failed to create ProRes 4444 Alpha source"
+        );
+
+        let item = probe_video(&source, "prores-alpha").unwrap();
+        assert_eq!(item.codec, "PRORES");
+        assert!(item.has_alpha, "ProRes 4444 source did not preserve Alpha");
+
+        let mut preset = preset_with_defaults("prores-alpha", "Alpha matte", "h264", "_matte");
+        preset.hardware = "cpu".into();
+        preset.output_container = "mp4".into();
+        preset.bitrate_mode = "target_mbps".into();
+        preset.target_bitrate_mbps = 1.0;
+        preset.output_mode = "single_folder".into();
+        preset.output_dir = root.join("encoded").to_string_lossy().to_string();
+        fs::create_dir_all(&preset.output_dir).unwrap();
+        let main_output = build_output_path(&item, &preset);
+        let alpha_output = build_alpha_output_path(&main_output);
+        let args = build_alpha_ffmpeg_args_with_sequence(&item, &preset, &alpha_output, None);
+        assert!(args.iter().any(|arg| arg.contains("alphaextract")));
+        let bitrate_index = args.iter().position(|arg| arg == "-b:v").unwrap();
+        assert_eq!(args[bitrate_index + 1], "300000");
+        let matte_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            matte_status.success(),
+            "ProRes 4444 Alpha matte encode failed"
+        );
+        let streams = probe_stream_types(&alpha_output);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["codec_type"], "video");
+        assert_eq!(streams[0]["width"], 64);
+        assert_eq!(streams[0]["height"], 36);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_audio_keeps_video_duration_and_adds_track() {
+        let root = std::env::temp_dir().join(format!("vsc-external-audio-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let video = root.join("silent.mp4");
+        let audio = root.join("short.wav");
+        let video_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=96x54:rate=24",
+                "-t",
+                "0.5",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(video_status.success());
+        let audio_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000",
+                "-t",
+                "0.1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&audio)
+            .status()
+            .unwrap();
+        assert!(audio_status.success());
+        let mut item = probe_video(&video, "external").unwrap();
+        assert_eq!(item.audio_tracks, 0);
+        item.external_audio = audio.to_string_lossy().to_string();
+        let mut preset = preset_with_defaults("external", "External", "h264", "_audio");
+        preset.hardware = "cpu".into();
+        preset.output_mode = "single_folder".into();
+        preset.output_dir = root.join("encoded").to_string_lossy().to_string();
+        fs::create_dir_all(&preset.output_dir).unwrap();
+        let output = build_output_path(&item, &preset);
+        let args = build_ffmpeg_args(&item, &preset, &output);
+        assert!(args.iter().any(|arg| arg == "1:a:0?"));
+        assert!(args.iter().any(|arg| arg == "apad"));
+        let status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "external audio encode failed");
+        let streams = probe_stream_types(&output);
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "video"));
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn probe_output_stream(path: &Path) -> Value {
         let output = command_with_hidden_window(resolve_tool("ffprobe"))
             .args([
@@ -3485,5 +5109,16 @@ mod tests {
         assert!(output.status.success(), "ffprobe output stream failed");
         let json: Value = serde_json::from_slice(&output.stdout).unwrap();
         json["streams"][0].clone()
+    }
+
+    fn probe_stream_types(path: &Path) -> Vec<Value> {
+        let output = command_with_hidden_window(resolve_tool("ffprobe"))
+            .args(["-v", "error", "-show_streams", "-print_format", "json"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ffprobe stream probe failed");
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["streams"].as_array().cloned().unwrap_or_default()
     }
 }

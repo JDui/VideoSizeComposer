@@ -78,7 +78,7 @@ export async function pickVideoFiles(): Promise<string[]> {
   const result = await open({
     multiple: true,
     directory: false,
-    filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "mxf", "avi", "webm", "m4v", "mts", "m2ts"] }]
+    filters: [{ name: "视频与音频媒体", extensions: ["mp4", "mov", "mkv", "mxf", "avi", "webm", "m4v", "mts", "m2ts", "3gp", "3g2", "mpeg", "mpg", "ts", "wmv", "flv", "ogv", "wav", "mp3", "flac", "aac", "m4a", "ogg", "opus", "wma", "aif", "aiff", "ac3", "eac3"] }]
   });
   if (!result) return [];
   return Array.isArray(result) ? result : [result];
@@ -93,6 +93,18 @@ export async function pickSequenceFrame(): Promise<string[]> {
       name: "序列帧",
       extensions: ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "exr", "dpx", "tga"]
     }]
+  });
+  if (!result) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
+/** Pick one or more external audio files for a silent video/sequence item. */
+export async function pickAudioFiles(): Promise<string[]> {
+  if (!isTauriRuntime) return [];
+  const result = await open({
+    multiple: true,
+    directory: false,
+    filters: [{ name: "音频文件", extensions: ["wav", "mp3", "flac", "aac", "m4a", "ogg", "opus", "wma", "aif", "aiff", "ac3", "eac3"] }]
   });
   if (!result) return [];
   return Array.isArray(result) ? result : [result];
@@ -203,16 +215,51 @@ export function normalizePreset(preset: Partial<Preset>): Preset {
   };
 }
 
-export function loadPreferences(): AppPreferences {
+function normalizePreferences(preferences: Partial<AppPreferences>): AppPreferences {
+  const defaultSequenceFps = Number(preferences.defaultSequenceFps);
+  return {
+    defaultHardware: preferences.defaultHardware === "cuda" || preferences.defaultHardware === "metal" || preferences.defaultHardware === "cpu"
+      ? preferences.defaultHardware
+      : "auto",
+    defaultOutputMode: preferences.defaultOutputMode === "single_folder" || preferences.defaultOutputMode === "in_place"
+      ? preferences.defaultOutputMode
+      : "subfolder",
+    defaultOutputDir: typeof preferences.defaultOutputDir === "string" ? preferences.defaultOutputDir : "",
+    keepTimesByDefault: preferences.keepTimesByDefault ?? defaultPreferences.keepTimesByDefault,
+    confirmBeforeClear: preferences.confirmBeforeClear ?? defaultPreferences.confirmBeforeClear,
+    autoOpenDetails: preferences.autoOpenDetails ?? defaultPreferences.autoOpenDetails,
+    defaultSequenceFps: Number.isFinite(defaultSequenceFps) && defaultSequenceFps > 0
+      ? defaultSequenceFps
+      : defaultPreferences.defaultSequenceFps
+  };
+}
+
+function readLegacyPreferences(): AppPreferences {
   try {
-    return { ...defaultPreferences, ...JSON.parse(localStorage.getItem(preferencesKey) ?? "{}") };
+    return normalizePreferences(JSON.parse(localStorage.getItem(preferencesKey) ?? "{}"));
   } catch {
     return defaultPreferences;
   }
 }
 
-export function savePreferences(preferences: AppPreferences) {
-  localStorage.setItem(preferencesKey, JSON.stringify(preferences));
+export async function loadPreferences(): Promise<AppPreferences> {
+  if (isTauriRuntime) {
+    const portable = await invoke<AppPreferences | null>("load_preferences");
+    if (portable) return normalizePreferences(portable);
+    const fallback = readLegacyPreferences();
+    await invoke("save_preferences", { preferences: fallback });
+    return fallback;
+  }
+  return readLegacyPreferences();
+}
+
+export async function savePreferences(preferences: AppPreferences): Promise<void> {
+  const normalized = normalizePreferences(preferences);
+  if (isTauriRuntime) {
+    await invoke("save_preferences", { preferences: normalized });
+    return;
+  }
+  localStorage.setItem(preferencesKey, JSON.stringify(normalized));
 }
 
 function demoPresets(): Preset[] {
@@ -283,16 +330,20 @@ function demoQueue(presetId: string): QueueItem[] {
     colorSpace: index === 0 ? "bt2020" : "bt709",
     colorTransfer: index === 0 ? "arib-std-b67" : "bt709",
     hdrMode: index === 0 ? "hlg" : "sdr",
-    audioTracks: index === 2 ? 2 : 1,
+    audioTracks: index === 1 ? 1 : index === 2 ? 0 : 1,
     subtitleTracks: index === 1 ? 1 : 0,
     panoramaTagged: row.isPanorama && index === 2,
-    mediaKind: "video",
+    mediaKind: index === 1 ? "audio" : "video",
     sequencePattern: "",
     sequenceStartNumber: 0,
     sequenceFrameCount: 0,
     sequenceFps: 30,
     sequencePixelAspect: 1,
-    hasAlpha: false,
+    hasAlpha: index === 0,
+    exportAlphaMask: index === 0,
+    alphaOutput: index === 0 ? `D:/Output/${row.fileName.replace(/\.[^.]+$/, "_alpha.mp4")}` : "",
+    externalAudio: index === 2 ? "D:/Media/ambient.wav" : "",
+    audioVisual: "timecode",
     ...row
   }));
 }

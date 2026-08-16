@@ -2,7 +2,7 @@ export type Codec = "h265" | "h264" | "av1" | "prores";
 export type Hardware = "auto" | "cuda" | "metal" | "cpu";
 export type OutputMode = "single_folder" | "in_place" | "subfolder";
 export type NamingMode = "original" | "suffix_prefix";
-export type OutputContainer = "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a";
+export type OutputContainer = "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav";
 export type ResolutionMode = "source" | "short_edge" | "scale_percent" | "custom";
 export type HdrMode = "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision";
 export type Chroma = "source" | "420" | "422";
@@ -80,12 +80,20 @@ export interface QueueItem {
   output: string;
   status: string;
   progress: number;
-  mediaKind: "video" | "sequence";
+  mediaKind: "video" | "sequence" | "audio";
   sequencePattern: string;
   sequenceStartNumber: number;
   sequenceFrameCount: number;
   sequenceFps: number;
   sequencePixelAspect: number;
+  /** Whether an independent black/white Alpha matte should be encoded. */
+  exportAlphaMask: boolean;
+  /** Final Alpha matte output path, populated after encoding. */
+  alphaOutput: string;
+  /** Optional external audio file used as the output soundtrack. */
+  externalAudio: string;
+  /** Visual generated for audio-only media when producing video. */
+  audioVisual: "timecode" | "black" | "white";
 }
 
 export interface EncodeJob {
@@ -100,6 +108,7 @@ export interface EncodeProgress {
   output?: string;
   ok?: boolean | null;
   message?: string;
+  alphaOutput?: string;
 }
 
 export interface AppPreferences {
