@@ -86,6 +86,38 @@ type ContextMenuState = {
   top: number;
 };
 
+/** 折叠面板状态：记忆在 localStorage，重启应用后仍保持上次展开的分组。 */
+function useToggleState(key: string, initial: boolean) {
+  const [open, setOpen] = useState(() => {
+    try {
+      const stored = localStorage.getItem(key);
+      return stored === null ? initial : stored === "1";
+    } catch {
+      return initial;
+    }
+  });
+  const toggle = () => {
+    setOpen((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem(key, next ? "1" : "0");
+      } catch {
+        /* 存储不可用时仅切换内存状态 */
+      }
+      return next;
+    });
+  };
+  const set = (value: boolean) => {
+    setOpen(value);
+    try {
+      localStorage.setItem(key, value ? "1" : "0");
+    } catch {
+      /* 存储不可用时仅更新内存状态 */
+    }
+  };
+  return [open, toggle, set] as const;
+}
+
 export default function App() {
   const [platform, setPlatform] = useState<PlatformInfo>(defaultPlatform);
   const [toolStatus, setToolStatus] = useState<ToolStatus>(defaultToolStatus);
@@ -95,9 +127,9 @@ export default function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [filter, setFilter] = useState("");
   const [presetFilter, setPresetFilter] = useState("");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [postprocessOpen, setPostprocessOpen] = useState(false);
-  const [deliveryOpen, setDeliveryOpen] = useState(true);
+  const [advancedOpen, toggleAdvanced] = useToggleState("vsc.settings.advancedOpen", false);
+  const [postprocessOpen, togglePostprocess, setPostprocess] = useToggleState("vsc.settings.postprocessOpen", false);
+  const [deliveryOpen, toggleDelivery] = useToggleState("vsc.settings.deliveryOpen", true);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [mediaInfoItemId, setMediaInfoItemId] = useState("");
   const [presetRailCollapsed, setPresetRailCollapsed] = useState(false);
@@ -534,7 +566,7 @@ export default function App() {
     const paths = await pickLutFiles();
     if (paths[0]) {
       updateActivePreset({ lutEnabled: true, lutName: paths[0] });
-      setPostprocessOpen(true);
+      setPostprocess(true);
       setNotice("LUT 已加入当前预设");
     }
   }
@@ -907,8 +939,10 @@ export default function App() {
           <div className="settings-section">
             <h3>输出格式</h3>
             <Setting label="格式"><select value={activePreset?.codec ?? "h265"} onChange={(event) => applyCodec(event.target.value as Codec)}>{Object.entries(codecLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
-            <Setting label="色深"><select value={activePreset?.bitDepth ?? "source"} onChange={(event) => updateActivePreset({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">原视频参数</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Setting>
-            <Setting label="色度采样"><select value={activePreset?.chroma ?? "source"} onChange={(event) => updateActivePreset({ chroma: event.target.value as Preset["chroma"] })}><option value="source">原视频参数</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Setting>
+            <div className="settings-pair">
+              <Setting label="色深"><select value={activePreset?.bitDepth ?? "source"} onChange={(event) => updateActivePreset({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">原视频参数</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Setting>
+              <Setting label="色度采样"><select value={activePreset?.chroma ?? "source"} onChange={(event) => updateActivePreset({ chroma: event.target.value as Preset["chroma"] })}><option value="source">原视频参数</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Setting>
+            </div>
           </div>
 
           <div className="settings-section">
@@ -933,17 +967,19 @@ export default function App() {
             <CheckCircle2 size={16} className={activePreset?.keepTimes ? "is-on" : ""} />
           </label>
 
-          <button className="collapse-row" onClick={() => setAdvancedOpen((open) => !open)}><span>高级选项</span><ChevronDown size={17} className={advancedOpen ? "rotated" : ""} /></button>
+          <button className="collapse-row" onClick={toggleAdvanced}><span>高级选项</span><ChevronDown size={17} className={advancedOpen ? "rotated" : ""} /></button>
           {advancedOpen && <div className="advanced-settings">
-            <Setting label="硬件"><select value={activePreset?.hardware ?? "auto"} onChange={(event) => updateActivePreset({ hardware: event.target.value as Hardware })}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
-            <Setting label="色彩空间"><select value={activePreset?.colorSpace ?? "source"} onChange={(event) => updateActivePreset({ colorSpace: event.target.value as Preset["colorSpace"] })}><option value="source">跟随源文件</option><option value="rec709">Rec.709</option><option value="rec2020">Rec.2020</option></select></Setting>
+            <div className="settings-pair">
+              <Setting label="硬件"><select value={activePreset?.hardware ?? "auto"} onChange={(event) => updateActivePreset({ hardware: event.target.value as Hardware })}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
+              <Setting label="色彩空间"><select value={activePreset?.colorSpace ?? "source"} onChange={(event) => updateActivePreset({ colorSpace: event.target.value as Preset["colorSpace"] })}><option value="source">跟随源文件</option><option value="rec709">Rec.709</option><option value="rec2020">Rec.2020</option></select></Setting>
+            </div>
             <Setting label="HDR"><select value={activePreset?.hdrMode ?? "source"} onChange={(event) => applyHdrMode(event.target.value as Preset["hdrMode"])}><option value="source">跟随源文件</option><option value="sdr">SDR / Rec.709</option><option value="hlg">HLG / Rec.2100</option><option value="hdr10">HDR10 / PQ</option><option value="dolby_vision">杜比视界（保留源流）</option></select></Setting>
             <label className="inline-check"><input type="checkbox" checked={activePreset?.keepPanorama ?? true} onChange={(event) => updateActivePreset({ keepPanorama: event.target.checked })} /><span>识别并保留全景元数据</span></label>
             <label className="inline-check"><input type="checkbox" checked={activePreset?.cpuFallback ?? true} onChange={(event) => updateActivePreset({ cpuFallback: event.target.checked })} /><span>硬件失败时回退 CPU</span></label>
             {activePreset?.hdrMode === "dolby_vision" && <div className="source-color-note"><ShieldCheck size={15} />杜比视界模式无损复制 HEVC 视频流，保留源 RPU；不可同时缩放或套 LUT。</div>}
           </div>}
 
-          <button className="postprocess-card" onClick={() => setPostprocessOpen((open) => !open)}><span><strong>后处理</strong><small>{activePreset?.lutEnabled ? `${shortPath(activePreset.lutName)} · ${activePreset.lutIntensity}%` : "LUT / 全景元数据"} · Alpha 背景：{alphaBackgroundLabel(activePreset?.alphaBackground)}</small></span><SlidersHorizontal size={17} /><ChevronDown size={17} className={postprocessOpen ? "rotated" : ""} /></button>
+          <button className="collapse-row has-subtitle" onClick={togglePostprocess}><span><strong>后处理</strong><small>{activePreset?.lutEnabled ? `${shortPath(activePreset.lutName)} · ${activePreset.lutIntensity}%` : "LUT / 全景元数据"} · Alpha 背景：{alphaBackgroundLabel(activePreset?.alphaBackground)}</small></span><ChevronDown size={17} className={postprocessOpen ? "rotated" : ""} /></button>
           {postprocessOpen && <div className="postprocess-settings">
             <Setting label="Alpha 背景"><select value={activePreset?.alphaBackground ?? "checkerboard"} onChange={(event) => updateActivePreset({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Setting>
             <small className="field-note">仅含 Alpha 通道的视频会将所选背景实际合成到输出。</small>
@@ -952,11 +988,10 @@ export default function App() {
             <label className="range-setting"><span>LUT 强度 <strong>{activePreset?.lutIntensity ?? 80}%</strong></span><input type="range" min={0} max={100} value={activePreset?.lutIntensity ?? 80} onChange={(event) => updateActivePreset({ lutIntensity: Number(event.target.value) })} /></label>
           </div>}
 
-          <button className="collapse-row" onClick={() => setDeliveryOpen((open) => !open)}><span>输出与命名</span><ChevronDown size={17} className={deliveryOpen ? "rotated" : ""} /></button>
+          <button className="collapse-row" onClick={toggleDelivery}><span>输出与命名</span><ChevronDown size={17} className={deliveryOpen ? "rotated" : ""} /></button>
           {deliveryOpen && <div className="delivery-settings">
             <Setting label="输出策略"><select value={activePreset?.outputMode ?? "subfolder"} onChange={(event) => updateActivePreset({ outputMode: event.target.value as Preset["outputMode"] })}><option value="single_folder">全部到同一目录</option><option value="in_place">原位导出</option><option value="subfolder">原位子文件夹</option></select></Setting>
             <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列/音频默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
-            {activePreset?.outputMode === "single_folder" && <button className="secondary-button full" onClick={chooseOutputFolder}><FolderOpen size={15} />{activePreset.outputDir ? shortPath(activePreset.outputDir) : "选择输出目录"}</button>}
             <Setting label="命名"><select value={activePreset?.namingMode ?? "suffix_prefix"} onChange={(event) => updateActivePreset({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
             {activePreset?.namingMode === "suffix_prefix" && <div className="naming-grid"><Setting label="前缀"><input value={activePreset.prefix} onChange={(event) => updateActivePreset({ prefix: event.target.value })} placeholder="可选" /></Setting><Setting label="后缀"><input value={activePreset.suffix} onChange={(event) => updateActivePreset({ suffix: event.target.value })} placeholder="_compressed" /></Setting></div>}
           </div>}
