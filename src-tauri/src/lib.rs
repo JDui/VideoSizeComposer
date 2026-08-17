@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -1072,7 +1072,33 @@ fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
         return item.size_bytes;
     }
     if preset.codec == "prores" {
-        return item.size_bytes.saturating_mul(2).max(64 * 1024 * 1024);
+        // ProRes 422 LT is a frame-oriented mezzanine codec.  A source-size
+        // multiplier is not useful when a small H.264 source is expanded to
+        // 4K or a long duration, so estimate from the actual output raster
+        // and frame rate.  2.0 bits/pixel/frame is slightly conservative for
+        // 422 LT across common camera content; audio and a 15% write margin
+        // are added below.
+        const PRORES_422_LT_BITS_PER_PIXEL_FRAME: f64 = 2.0;
+        let (width, height) = estimated_output_dimensions(item, preset);
+        let fps = estimated_output_fps(item, preset);
+        let duration = item.duration.max(1.0);
+        let video_bits =
+            (width as f64) * (height as f64) * fps * duration * PRORES_422_LT_BITS_PER_PIXEL_FRAME;
+        let audio_bits = if item.audio_tracks > 0 || !item.external_audio.trim().is_empty() {
+            320_000.0 * duration
+        } else {
+            0.0
+        };
+        let encoded_bytes = ((video_bits + audio_bits) / 8.0) as u64;
+        let with_margin = encoded_bytes
+            .saturating_mul(115)
+            .saturating_div(100)
+            .saturating_add(64 * 1024 * 1024);
+        return item
+            .size_bytes
+            .saturating_mul(2)
+            .max(with_margin)
+            .max(64 * 1024 * 1024);
     }
     let audio_bits = if item.audio_tracks > 0 || !item.external_audio.trim().is_empty() {
         320_000
@@ -1081,6 +1107,58 @@ fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
     };
     let bits_per_second = target_bitrate(item, preset).saturating_add(audio_bits);
     ((bits_per_second as f64 * item.duration.max(1.0) / 8.0) * 1.10) as u64
+}
+
+fn estimated_output_dimensions(item: &QueueItem, preset: &Preset) -> (u64, u64) {
+    let source_width = u64::from(item.width.max(2));
+    let source_height = u64::from(item.height.max(2));
+    match preset.resolution_mode.as_str() {
+        "short_edge" => {
+            let short_edge = u64::from(preset.short_edge.max(120));
+            if source_width >= source_height {
+                (
+                    even_ceil(source_width.saturating_mul(short_edge) / source_height),
+                    short_edge,
+                )
+            } else {
+                (
+                    short_edge,
+                    even_ceil(source_height.saturating_mul(short_edge) / source_width),
+                )
+            }
+        }
+        "scale_percent" => {
+            let percent = u64::from(preset.scale_percent.clamp(10, 90));
+            (
+                (source_width.saturating_mul(percent) / 100).max(2) / 2 * 2,
+                (source_height.saturating_mul(percent) / 100).max(2) / 2 * 2,
+            )
+        }
+        "custom" => (
+            u64::from((preset.custom_width.max(2) / 2) * 2),
+            u64::from((preset.custom_height.max(2) / 2) * 2),
+        ),
+        _ => (source_width, source_height),
+    }
+}
+
+fn even_ceil(value: u64) -> u64 {
+    value.saturating_add(1) / 2 * 2
+}
+
+fn estimated_output_fps(item: &QueueItem, preset: &Preset) -> f64 {
+    if let Some(fps) = output_fps(preset) {
+        return fps;
+    }
+    if item.media_kind == "sequence" && item.sequence_fps.is_finite() && item.sequence_fps > 0.0 {
+        return item.sequence_fps;
+    }
+    item.fps
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(30.0)
 }
 
 #[tauri::command]
@@ -2265,11 +2343,7 @@ fn run_ffmpeg(
     });
 
     let mut tail = Vec::new();
-    if let Some(stderr) = child
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.stderr.take())
-    {
+    if let Some(stderr) = child.lock().ok().and_then(|mut guard| guard.stderr.take()) {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if cancel.load(Ordering::Relaxed) {
@@ -2426,6 +2500,51 @@ fn is_isobmff_path(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn movflags_for_output(codec: &str, extension: &str, panorama: bool) -> Option<&'static str> {
+    if !matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "mp4" | "mov" | "m4v"
+    ) {
+        return None;
+    }
+    // Panorama injection requires moov after mdat. ProRes MOV is also kept
+    // in that layout so FFmpeg does not perform a second full-file faststart
+    // pass over very large mezzanine files.
+    if panorama || (codec.eq_ignore_ascii_case("prores") && extension.eq_ignore_ascii_case("mov")) {
+        Some("+use_metadata_tags")
+    } else {
+        Some("+faststart+use_metadata_tags")
+    }
+}
+
+const LARGE_FRAME_PIXEL_THRESHOLD: u64 = 16_000_000;
+
+fn should_limit_frame_threads(item: &QueueItem, preset: &Preset) -> bool {
+    let (target_width, target_height) = estimated_output_dimensions(item, preset);
+    let source_pixels = u64::from(item.width.max(2)).saturating_mul(u64::from(item.height.max(2)));
+    let target_pixels = target_width.saturating_mul(target_height);
+    let large_frame = source_pixels.max(target_pixels) >= LARGE_FRAME_PIXEL_THRESHOLD;
+    let has_alpha_path = item.has_alpha;
+    let has_hdr_filter = color_conversion_filter(item, preset).is_some();
+    large_frame && (has_alpha_path || has_hdr_filter || preset.codec == "prores")
+}
+
+fn append_frame_memory_safety_args(args: &mut Vec<String>, item: &QueueItem, preset: &Preset) {
+    if should_limit_frame_threads(item, preset) {
+        // A single decoded 8K RGBA/HDR frame is already hundreds of MiB.
+        // Keep FFmpeg from retaining several such frames in parallel while
+        // preserving the unavoidable working set for the current frame.
+        args.extend([
+            "-filter_threads".into(),
+            "1".into(),
+            "-filter_complex_threads".into(),
+            "1".into(),
+            "-threads".into(),
+            "2".into(),
+        ]);
+    }
 }
 
 fn unique_output_path(base: &Path) -> PathBuf {
@@ -2589,6 +2708,7 @@ fn build_ffmpeg_args_with_sequence(
             args.extend(["-tag:v".into(), "hvc1".into()]);
         }
     }
+    append_frame_memory_safety_args(&mut args, item, preset);
 
     let audio_codec = if output_extension(item, preset) == "webm" {
         "libopus"
@@ -2609,15 +2729,11 @@ fn build_ffmpeg_args_with_sequence(
             "stereo_mode=mono".into(),
         ]);
     }
-    if matches!(
-        output_extension(item, preset).as_str(),
-        "mp4" | "mov" | "m4v"
+    if let Some(movflags) = movflags_for_output(
+        &preset.codec,
+        &output_extension(item, preset),
+        preset.keep_panorama && item.is_panorama,
     ) {
-        let movflags = if preset.keep_panorama && item.is_panorama {
-            "+use_metadata_tags"
-        } else {
-            "+faststart+use_metadata_tags"
-        };
         args.extend(["-movflags".into(), movflags.into()]);
     }
     append_output_fps(&mut args, preset);
@@ -2764,6 +2880,7 @@ fn build_ffmpeg_args_with_audio(
     if item.media_kind != "audio" {
         add_color_output_args(&mut args, item, preset, &encoder);
     }
+    append_frame_memory_safety_args(&mut args, item, preset);
     let audio_codec = if extension == "webm" {
         "libopus"
     } else {
@@ -2779,8 +2896,17 @@ fn build_ffmpeg_args_with_audio(
         "-t".into(),
         format!("{:.6}", item.duration.max(0.001)),
     ]);
-    if matches!(extension.as_str(), "mp4" | "mov" | "m4v") {
-        args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
+    let panorama = preset.keep_panorama && item.is_panorama;
+    if panorama {
+        args.extend([
+            "-metadata:s:v:0".into(),
+            "projection=equirectangular".into(),
+            "-metadata:s:v:0".into(),
+            "stereo_mode=mono".into(),
+        ]);
+    }
+    if let Some(movflags) = movflags_for_output(&preset.codec, &extension, panorama) {
+        args.extend(["-movflags".into(), movflags.into()]);
     }
     append_output_fps(&mut args, preset);
     args.push(output.to_string_lossy().to_string());
@@ -2872,11 +2998,13 @@ fn build_alpha_ffmpeg_args_with_sequence(
         "libaom-av1" => args.extend(["-cpu-used".into(), "6".into(), "-row-mt".into(), "1".into()]),
         _ => {}
     }
-    if matches!(
-        output.extension().and_then(|value| value.to_str()),
-        Some("mp4" | "mov" | "m4v")
-    ) {
-        args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
+    append_frame_memory_safety_args(&mut args, item, preset);
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if let Some(movflags) = movflags_for_output(&preset.codec, extension, false) {
+        args.extend(["-movflags".into(), movflags.into()]);
     }
     append_output_fps(&mut args, preset);
     args.push(output.to_string_lossy().to_string());
@@ -3345,7 +3473,9 @@ fn detect_panorama_shape(json: &Value) -> bool {
                 .find(|stream| stream["codec_type"] == "video")
         })
         .and_then(|video| Some((video["width"].as_f64()?, video["height"].as_f64()?)))
-        .map(|(width, height)| height > 0.0 && width / height >= 1.95)
+        // An unlabeled 2:1 equirectangular frame is a useful candidate, but
+        // ordinary cinematic 2.39:1/32:9 footage must not be treated as VR.
+        .map(|(width, height)| height > 0.0 && (1.95..=2.05).contains(&(width / height)))
         .unwrap_or(false)
 }
 
@@ -3422,18 +3552,7 @@ fn named_child(
     .find_map(|(info, kind)| (kind == *name).then_some(info))
 }
 
-fn video_track_path(data: &[u8]) -> Result<Vec<Mp4BoxInfo>, String> {
-    let moov = child_boxes(data, 0, data.len())
-        .into_iter()
-        .find_map(|(info, name)| (name == *b"moov").then_some(info))
-        .ok_or_else(|| "输出文件缺少 moov 容器".to_string())?;
-    let mdat = child_boxes(data, 0, data.len())
-        .into_iter()
-        .find_map(|(info, name)| (name == *b"mdat").then_some(info))
-        .ok_or_else(|| "输出文件缺少 mdat 数据".to_string())?;
-    if moov.start < mdat.start {
-        return Err("全景元数据注入要求 moov 位于媒体数据之后".into());
-    }
+fn video_track_path_in_moov(data: &[u8], moov: Mp4BoxInfo) -> Result<Vec<Mp4BoxInfo>, String> {
     for (trak, name) in child_boxes(data, moov.start + moov.header_size, moov.end()) {
         if name != *b"trak" {
             continue;
@@ -3457,6 +3576,202 @@ fn video_track_path(data: &[u8]) -> Result<Vec<Mp4BoxInfo>, String> {
         return Ok(vec![moov, trak, mdia, minf, stbl, stsd, sample]);
     }
     Err("输出文件中没有可注入的主视频轨".into())
+}
+
+#[derive(Clone, Copy)]
+struct FileBoxInfo {
+    start: u64,
+    size: u64,
+}
+
+impl FileBoxInfo {
+    fn end(self) -> u64 {
+        self.start + self.size
+    }
+}
+
+fn read_file_box_header(
+    file: &mut fs::File,
+    start: u64,
+    file_len: u64,
+) -> Result<Option<(FileBoxInfo, [u8; 4])>, String> {
+    if start >= file_len {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| error.to_string())?;
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("无法读取 MP4 容器头：{error}"))?;
+    let size32 = u32::from_be_bytes(header[..4].try_into().unwrap());
+    let name: [u8; 4] = header[4..8].try_into().unwrap();
+    let (size, header_size) = if size32 == 1 {
+        if start.checked_add(16).map_or(true, |end| end > file_len) {
+            return Err("MP4 扩展尺寸头超出文件范围".into());
+        }
+        let mut extended = [0u8; 8];
+        file.read_exact(&mut extended)
+            .map_err(|error| format!("无法读取 MP4 扩展尺寸：{error}"))?;
+        (u64::from_be_bytes(extended), 16)
+    } else if size32 == 0 {
+        (file_len.saturating_sub(start), 8)
+    } else {
+        (u64::from(size32), 8)
+    };
+    if size < header_size {
+        return Err("MP4 容器尺寸小于头部".into());
+    }
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| "MP4 容器尺寸溢出".to_string())?;
+    if end > file_len {
+        return Err("MP4 容器超出文件范围".into());
+    }
+    Ok(Some((FileBoxInfo { start, size }, name)))
+}
+
+fn locate_mp4_metadata_boxes(path: &Path) -> Result<(FileBoxInfo, FileBoxInfo), String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let file_len = file.metadata().map_err(|error| error.to_string())?.len();
+    let mut cursor = 0u64;
+    let mut moov = None;
+    let mut mdat = None;
+    while cursor < file_len {
+        let Some((info, name)) = read_file_box_header(&mut file, cursor, file_len)? else {
+            break;
+        };
+        if name == *b"moov" && moov.is_none() {
+            moov = Some(info);
+        } else if name == *b"mdat" {
+            mdat = Some(info);
+        }
+        cursor = info.end();
+    }
+    let moov = moov.ok_or_else(|| "输出文件缺少 moov 容器".to_string())?;
+    let mdat = mdat.ok_or_else(|| "输出文件缺少 mdat 数据".to_string())?;
+    Ok((moov, mdat))
+}
+
+fn read_file_region(path: &Path, region: FileBoxInfo) -> Result<Vec<u8>, String> {
+    const MAX_MOOV_BYTES: u64 = 512 * 1024 * 1024;
+    if region.size > MAX_MOOV_BYTES {
+        return Err("moov 容器过大，拒绝分配超出安全上限的内存".into());
+    }
+    let size = usize::try_from(region.size).map_err(|_| "moov 容器超过当前平台内存寻址范围")?;
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(region.start))
+        .map_err(|error| error.to_string())?;
+    let mut data = vec![0u8; size];
+    file.read_exact(&mut data)
+        .map_err(|error| format!("无法读取 moov 容器：{error}"))?;
+    Ok(data)
+}
+
+fn move_file_range_in_place(
+    file: &mut fs::File,
+    source_start: u64,
+    destination_start: u64,
+    length: u64,
+) -> Result<(), String> {
+    if length == 0 || source_start == destination_start {
+        return Ok(());
+    }
+    const MOVE_BUFFER_BYTES: usize = 1024 * 1024;
+    let mut buffer = vec![0u8; MOVE_BUFFER_BYTES];
+    if destination_start > source_start {
+        // Expand toward the end: copy backwards so unread source bytes are
+        // never overwritten by the destination range.
+        let mut remaining = length;
+        while remaining > 0 {
+            let chunk = remaining.min(MOVE_BUFFER_BYTES as u64);
+            let source = source_start
+                .checked_add(remaining - chunk)
+                .ok_or("MP4 尾随容器源位置溢出")?;
+            let destination = destination_start
+                .checked_add(remaining - chunk)
+                .ok_or("MP4 尾随容器目标位置溢出")?;
+            file.seek(SeekFrom::Start(source))
+                .map_err(|error| error.to_string())?;
+            file.read_exact(&mut buffer[..chunk as usize])
+                .map_err(|error| error.to_string())?;
+            file.seek(SeekFrom::Start(destination))
+                .map_err(|error| error.to_string())?;
+            file.write_all(&buffer[..chunk as usize])
+                .map_err(|error| error.to_string())?;
+            remaining -= chunk;
+        }
+    } else {
+        // Contract toward the beginning: copy forwards for the same overlap
+        // safety in the opposite direction.
+        let mut offset = 0u64;
+        while offset < length {
+            let chunk = (length - offset).min(MOVE_BUFFER_BYTES as u64);
+            let source = source_start
+                .checked_add(offset)
+                .ok_or("MP4 尾随容器源位置溢出")?;
+            let destination = destination_start
+                .checked_add(offset)
+                .ok_or("MP4 尾随容器目标位置溢出")?;
+            file.seek(SeekFrom::Start(source))
+                .map_err(|error| error.to_string())?;
+            file.read_exact(&mut buffer[..chunk as usize])
+                .map_err(|error| error.to_string())?;
+            file.seek(SeekFrom::Start(destination))
+                .map_err(|error| error.to_string())?;
+            file.write_all(&buffer[..chunk as usize])
+                .map_err(|error| error.to_string())?;
+            offset += chunk;
+        }
+    }
+    Ok(())
+}
+
+fn replace_moov_box(path: &Path, original: FileBoxInfo, replacement: &[u8]) -> Result<(), String> {
+    let replacement_size = u64::try_from(replacement.len()).map_err(|_| "新的 moov 尺寸溢出")?;
+    let file_len = fs::metadata(path).map_err(|error| error.to_string())?.len();
+    if original.end() > file_len {
+        return Err("原始 moov 超出文件范围".into());
+    }
+    let new_file_len = file_len
+        .checked_sub(original.size)
+        .and_then(|size| size.checked_add(replacement_size))
+        .ok_or_else(|| "输出文件尺寸溢出".to_string())?;
+    let tail_start = original.end();
+    let tail_length = file_len.saturating_sub(tail_start);
+    let delta = replacement_size as i128 - original.size as i128;
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    if delta > 0 {
+        file.set_len(new_file_len)
+            .map_err(|error| error.to_string())?;
+        move_file_range_in_place(
+            &mut file,
+            tail_start,
+            tail_start
+                .checked_add(delta as u64)
+                .ok_or("MP4 尾随容器目标位置溢出")?,
+            tail_length,
+        )?;
+    } else if delta < 0 {
+        let destination = tail_start
+            .checked_sub((-delta) as u64)
+            .ok_or("MP4 尾随容器目标位置下溢")?;
+        move_file_range_in_place(&mut file, tail_start, destination, tail_length)?;
+    }
+    file.seek(SeekFrom::Start(original.start))
+        .map_err(|error| error.to_string())?;
+    file.write_all(replacement)
+        .map_err(|error| error.to_string())?;
+    if delta < 0 {
+        file.set_len(new_file_len)
+            .map_err(|error| error.to_string())?;
+    }
+    file.sync_all().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn set_box_size(data: &mut [u8], info: Mp4BoxInfo, delta: usize) -> Result<(), String> {
@@ -3510,8 +3825,18 @@ fn spherical_v1_uuid_box() -> Vec<u8> {
 }
 
 fn inject_spherical_metadata(path: &Path) -> Result<(), String> {
-    let mut data = fs::read(path).map_err(|error| error.to_string())?;
-    let path_before = video_track_path(&data)?;
+    let (moov_region, mdat_region) = locate_mp4_metadata_boxes(path)?;
+    if moov_region.start < mdat_region.start {
+        return Err("全景元数据注入要求 moov 位于媒体数据之后".into());
+    }
+    // Only the moov box is materialized. mdat and any other top-level media
+    // boxes remain in place; only a trailing region is moved in bounded chunks.
+    let mut data = read_file_region(path, moov_region)?;
+    let moov = read_mp4_box(&data, 0, data.len())
+        .filter(|(_, name)| name == b"moov")
+        .map(|(info, _)| info)
+        .ok_or_else(|| "输出文件缺少 moov 容器".to_string())?;
+    let path_before = video_track_path_in_moov(&data, moov)?;
     let sample = *path_before.last().unwrap();
     let child_start = sample.start + sample.header_size + 78;
     let has_v2 = child_start <= sample.end()
@@ -3527,7 +3852,11 @@ fn inject_spherical_metadata(path: &Path) -> Result<(), String> {
         }
     }
 
-    let path_after = video_track_path(&data)?;
+    let moov_after = read_mp4_box(&data, 0, data.len())
+        .filter(|(_, name)| name == b"moov")
+        .map(|(info, _)| info)
+        .ok_or_else(|| "输出文件缺少 moov 容器".to_string())?;
+    let path_after = video_track_path_in_moov(&data, moov_after)?;
     let moov = path_after[0];
     let trak = path_after[1];
     const UUID: [u8; 16] = [
@@ -3544,7 +3873,10 @@ fn inject_spherical_metadata(path: &Path) -> Result<(), String> {
         set_box_size(&mut data, trak, delta)?;
         set_box_size(&mut data, moov, delta)?;
     }
-    fs::write(path, data).map_err(|error| error.to_string())
+    if data.len() as u64 != moov_region.size || data.is_empty() {
+        replace_moov_box(path, moov_region, &data)?;
+    }
+    Ok(())
 }
 
 fn verify_spherical_metadata(path: &Path) -> Result<(), String> {
@@ -4252,7 +4584,10 @@ mod tests {
         dovi.fps_value = 24.0;
         let args = build_ffmpeg_args(&dovi_item, &dovi, Path::new("dovi.mp4")).join(" ");
         assert!(args.contains("-c:v copy"));
-        assert!(!args.contains(" -r "), "dolby vision must not add -r: {args}");
+        assert!(
+            !args.contains(" -r "),
+            "dolby vision must not add -r: {args}"
+        );
 
         // 校验：未知帧率模式或非正数目标帧率会被拒绝
         let mut invalid = preset.clone();
@@ -4651,11 +4986,176 @@ mod tests {
         let panorama_json =
             serde_json::json!({"streams":[{"codec_type":"video","width":4096,"height":2048}]});
         assert!(detect_panorama(&panorama_json));
+        let ordinary_ultrawide =
+            serde_json::json!({"streams":[{"codec_type":"video","width":2390,"height":1000}]});
+        assert!(!detect_panorama(&ordinary_ultrawide));
+        let tagged_ultrawide = serde_json::json!({
+            "streams":[{"codec_type":"video","width":2390,"height":1000}],
+            "format":{"tags":{"projection":"equirectangular"}}
+        });
+        assert!(detect_panorama(&tagged_ultrawide));
         let dovi_json = serde_json::json!({"codec_tag_string":"dvhe","side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8}]});
         assert_eq!(detect_hdr_mode(&dovi_json), "dolby_vision");
         item.is_panorama = false;
         assert!(!item.is_panorama);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prores_space_estimate_uses_target_raster_rate_audio_and_margin() {
+        let root = std::env::temp_dir().join(format!("vsc-prores-estimate-{}", Uuid::new_v4()));
+        let mut item = QueueItem {
+            id: "prores-estimate".into(),
+            source: root.join("small.mp4").to_string_lossy().to_string(),
+            file_name: "small.mp4".into(),
+            codec: "H264".into(),
+            width: 3840,
+            height: 2160,
+            fps: "30 fps".into(),
+            bitrate: 2_000_000,
+            duration: 120.0,
+            size_bytes: 20 * 1024 * 1024,
+            thumbnail: String::new(),
+            is_panorama: false,
+            panorama_tagged: false,
+            bit_depth: 8,
+            chroma: "420".into(),
+            color_space: "bt709".into(),
+            color_transfer: "bt709".into(),
+            hdr_mode: "sdr".into(),
+            audio_tracks: 1,
+            subtitle_tracks: 0,
+            preset_id: "prores-estimate".into(),
+            selected: true,
+            output: String::new(),
+            status: "等待中".into(),
+            progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            has_alpha: false,
+            sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
+        };
+        let mut preset = preset_with_defaults("prores-estimate", "ProRes", "prores", "_prores");
+        preset.resolution_mode = "source".into();
+        preset.fps_mode = "source".into();
+        item.external_audio = "external.wav".into();
+        let estimate = estimated_output_bytes(&item, &preset);
+        assert!(
+            estimate > item.size_bytes.saturating_mul(2),
+            "4K/120s ProRes estimate should exceed source-size multiplier: {estimate}"
+        );
+        assert!(
+            estimate > 8_000_000_000,
+            "2.0 bpp/frame estimate should be conservatively above 8 GB"
+        );
+    }
+
+    #[test]
+    fn prores_mov_and_large_frame_safety_arguments_are_scoped() {
+        assert_eq!(
+            movflags_for_output("prores", "mov", false),
+            Some("+use_metadata_tags")
+        );
+        assert_eq!(
+            movflags_for_output("h265", "mov", false),
+            Some("+faststart+use_metadata_tags")
+        );
+        assert_eq!(
+            movflags_for_output("prores", "mp4", false),
+            Some("+faststart+use_metadata_tags")
+        );
+
+        let mut item = QueueItem {
+            id: "large-alpha".into(),
+            source: "large.mov".into(),
+            file_name: "large.mov".into(),
+            codec: "PRORES".into(),
+            width: 5760,
+            height: 2880,
+            fps: "30 fps".into(),
+            bitrate: 0,
+            duration: 1.0,
+            size_bytes: 1,
+            thumbnail: String::new(),
+            is_panorama: false,
+            panorama_tagged: false,
+            bit_depth: 12,
+            chroma: "444".into(),
+            color_space: "bt2020".into(),
+            color_transfer: "smpte2084".into(),
+            hdr_mode: "hdr10".into(),
+            audio_tracks: 0,
+            subtitle_tracks: 0,
+            preset_id: "large-alpha".into(),
+            selected: true,
+            output: String::new(),
+            status: "等待中".into(),
+            progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            has_alpha: true,
+            sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
+        };
+        let mut preset = preset_with_defaults("large-prores", "ProRes", "prores", "_prores");
+        preset.hdr_mode = "hdr10".into();
+        preset.color_space = "rec2020".into();
+        let mut external_audio_item = item.clone();
+        external_audio_item.external_audio = "audio.wav".into();
+        external_audio_item.is_panorama = true;
+        let external_audio_args =
+            build_ffmpeg_args(&external_audio_item, &preset, Path::new("large.mov")).join(" ");
+        assert!(external_audio_args.contains("-movflags +use_metadata_tags"));
+        assert!(!external_audio_args.contains("+faststart"));
+        assert!(external_audio_args.contains("projection=equirectangular"));
+        let alpha_args = build_alpha_ffmpeg_args_with_sequence(
+            &item,
+            &preset,
+            Path::new("large_alpha.mov"),
+            None,
+        )
+        .join(" ");
+        assert!(alpha_args.contains("-movflags +use_metadata_tags"));
+        assert!(!alpha_args.contains("+faststart"));
+        assert!(should_limit_frame_threads(&item, &preset));
+        let mut args = Vec::new();
+        append_frame_memory_safety_args(&mut args, &item, &preset);
+        assert!(args.windows(2).any(|pair| pair == ["-filter_threads", "1"]));
+        assert!(args.windows(2).any(|pair| pair == ["-threads", "2"]));
+
+        item.width = 3840;
+        item.height = 2160;
+        item.has_alpha = false;
+        item.hdr_mode = "sdr".into();
+        preset.hdr_mode = "source".into();
+        preset.color_space = "source".into();
+        assert!(!should_limit_frame_threads(&item, &preset));
+
+        item.width = 1920;
+        item.height = 1080;
+        item.has_alpha = false;
+        item.hdr_mode = "sdr".into();
+        preset.hdr_mode = "source".into();
+        preset.color_space = "source".into();
+        assert!(!should_limit_frame_threads(&item, &preset));
+        let mut normal_args = Vec::new();
+        append_frame_memory_safety_args(&mut normal_args, &item, &preset);
+        assert!(normal_args.is_empty());
     }
 
     #[test]
@@ -4700,6 +5200,94 @@ mod tests {
             .to_string()
             .to_ascii_lowercase()
             .contains("equirectangular"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spherical_metadata_injection_reads_only_moov_for_large_sparse_media() {
+        let root = std::env::temp_dir().join(format!("vsc-panorama-sparse-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        let status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x320:rate=24",
+                "-t",
+                "0.25",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+use_metadata_tags",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let generated = fs::read(&source).unwrap();
+        let boxes = child_boxes(&generated, 0, generated.len());
+        let ftyp = boxes
+            .iter()
+            .find_map(|(info, name)| {
+                (name == b"ftyp").then_some(&generated[info.start..info.end()])
+            })
+            .expect("test MP4 should contain ftyp");
+        let moov = boxes
+            .iter()
+            .find_map(|(info, name)| {
+                (name == b"moov").then_some(&generated[info.start..info.end()])
+            })
+            .expect("test MP4 should contain moov");
+
+        let target = root.join("large-sparse.mp4");
+        let mut file = fs::File::create(&target).unwrap();
+        file.write_all(ftyp).unwrap();
+        const MEDIA_SIZE: u64 = 512 * 1024 * 1024;
+        let mdat_start = file.stream_position().unwrap();
+        file.write_all(&((MEDIA_SIZE as u32).to_be_bytes()))
+            .unwrap();
+        file.write_all(b"mdat").unwrap();
+        file.set_len(mdat_start + MEDIA_SIZE).unwrap();
+        file.seek(SeekFrom::Start(mdat_start + MEDIA_SIZE)).unwrap();
+        file.write_all(moov).unwrap();
+        file.write_all(&12u32.to_be_bytes()).unwrap();
+        file.write_all(b"free").unwrap();
+        file.write_all(&[0; 4]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        inject_spherical_metadata(&target).unwrap();
+        let (moov_region, mdat_region) = locate_mp4_metadata_boxes(&target).unwrap();
+        assert!(moov_region.start > mdat_region.start);
+        let injected_moov = read_file_region(&target, moov_region).unwrap();
+        assert!(injected_moov.windows(4).any(|window| window == b"st3d"));
+        assert!(injected_moov.windows(4).any(|window| window == b"sv3d"));
+        assert!(injected_moov.windows(4).any(|window| window == b"uuid"));
+        let mut check = fs::File::open(&target).unwrap();
+        let target_len = check.metadata().unwrap().len();
+        let (free_region, free_name) =
+            read_file_box_header(&mut check, moov_region.end(), target_len)
+                .unwrap()
+                .expect("tail free box should remain after moov");
+        assert_eq!(free_name, *b"free");
+        assert_eq!(free_region.size, 12);
+        check.seek(SeekFrom::Start(free_region.start + 8)).unwrap();
+        let mut free_payload = [0u8; 4];
+        check.read_exact(&mut free_payload).unwrap();
+        assert_eq!(free_payload, [0; 4]);
+        assert_eq!(
+            target_len,
+            ftyp.len() as u64 + MEDIA_SIZE + injected_moov.len() as u64 + 12
+        );
 
         let _ = fs::remove_dir_all(root);
     }

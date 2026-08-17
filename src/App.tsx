@@ -89,7 +89,10 @@ const presetDescriptions: Record<Codec, string> = {
 const packageVersion = typeof packageMetadata.version === "string" && packageMetadata.version.trim()
   ? packageMetadata.version
   : "unknown";
-const functionVersion = deriveFunctionVersion(packageVersion);
+const displayVersion = typeof packageMetadata.displayVersion === "string" && packageMetadata.displayVersion.trim()
+  ? packageMetadata.displayVersion
+  : deriveDisplayVersion(packageVersion);
+const functionVersion = deriveFunctionVersion(displayVersion);
 
 type ContextMenuState = {
   kind: "preset" | "media";
@@ -1104,7 +1107,7 @@ export default function App() {
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.confirmBeforeClear} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, confirmBeforeClear: event.target.checked }))} /><span>清空媒体列表前要求确认</span></label>
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.autoOpenDetails} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, autoOpenDetails: event.target.checked }))} /><span>开始编码时自动展开任务详情</span></label>
         </div>
-        <div className="version-card" aria-label={`软件版本 ${packageVersion}`}><span><strong>软件版本</strong><small>功能版本 {functionVersion}</small></span><code>{packageVersion}</code></div>
+        <div className="version-card" aria-label={`软件版本 ${displayVersion}`}><span><strong>软件版本</strong><small>功能版本 {functionVersion}</small></span><code>{displayVersion}</code></div>
         <button className="secondary-button full" onClick={applyPreferenceDefaults}>将这些默认值应用到当前任务</button>
       </Modal>}
 
@@ -1388,11 +1391,16 @@ function audioVisualLabel(visual: QueueItem["audioVisual"]) {
   return "居中时间码";
 }
 
-function deriveFunctionVersion(version: string) {
-  const [year, feature] = version.split(".");
-  return /^\d{4}$/.test(year ?? "") && /^\d+$/.test(feature ?? "")
-    ? `${year}.${feature}`
+function deriveDisplayVersion(version: string) {
+  const [year, feature, patch] = version.split(".");
+  return /^\d{4}$/.test(year ?? "") && /^\d+$/.test(feature ?? "") && /^\d+$/.test(patch ?? "")
+    ? `${year}v${feature}-${patch}`
     : "unknown";
+}
+
+function deriveFunctionVersion(version: string) {
+  const match = /^(\d{4})v(\d+)-\d+$/.exec(version.trim());
+  return match ? `${match[1]}v${match[2]}` : "unknown";
 }
 
 function previewOutput(item: QueueItem, preset: Preset) {
