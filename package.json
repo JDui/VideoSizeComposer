@@ -1,8 +1,8 @@
 {
   "name": "videosize-composer",
   "private": true,
-  "version": "2026.4.33",
-  "displayVersion": "2026v4-33",
+  "version": "2026.4.35",
+  "displayVersion": "2026v4-35",
   "type": "module",
   "scripts": {
     "dev": "vite",
