@@ -180,7 +180,9 @@ struct QueueItem {
     sequence_fps: f64,
     #[serde(default = "default_pixel_aspect")]
     sequence_pixel_aspect: f64,
-    #[serde(default)]
+    // Keep the complete frame list inside the Rust backend. Serializing thousands of
+    // absolute paths through Tauri IPC made large sequence imports unnecessarily expensive.
+    #[serde(default, skip_serializing, skip_deserializing)]
     sequence_frames: Vec<String>,
     #[serde(default)]
     export_alpha_mask: bool,
@@ -698,14 +700,62 @@ fn is_sequence_frame(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn estimate_sequence_size_bytes(frames: &[PathBuf]) -> u64 {
+    if frames.is_empty() {
+        return 0;
+    }
+    // Frame sizes within one render sequence are normally close. Sampling at most
+    // eight evenly distributed frames avoids an O(N) metadata pass during import.
+    let sample_count = frames.len().min(8);
+    let mut sampled_bytes = 0u128;
+    let mut successful_samples = 0u128;
+    for sample_index in 0..sample_count {
+        let index = if sample_count == 1 {
+            0
+        } else {
+            sample_index * (frames.len() - 1) / (sample_count - 1)
+        };
+        if let Ok(metadata) = frames[index].metadata() {
+            sampled_bytes = sampled_bytes.saturating_add(u128::from(metadata.len()));
+            successful_samples += 1;
+        }
+    }
+    if successful_samples == 0 {
+        return 0;
+    }
+    sampled_bytes
+        .saturating_mul(frames.len() as u128)
+        .saturating_div(successful_samples)
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn hydrate_sequence_frames(item: &mut QueueItem) -> Result<(), String> {
+    if item.media_kind != "sequence" {
+        return Ok(());
+    }
+    let frames = collect_sequence_groups(vec![item.source.clone()])
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("序列“{}”已无法从源目录解析，请重新载入", item.file_name))?;
+    if item.sequence_frame_count > 0 && frames.len() != item.sequence_frame_count as usize {
+        return Err(format!(
+            "序列“{}”的帧数已从 {} 变为 {}，请重新载入",
+            item.file_name,
+            item.sequence_frame_count,
+            frames.len()
+        ));
+    }
+    item.sequence_frames = frames
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    Ok(())
+}
+
 fn probe_sequence(frames: &[PathBuf], preset_id: &str, fps: f64) -> Result<QueueItem, String> {
     let first = frames.first().ok_or_else(|| "空序列".to_string())?;
     let mut item = probe_video(first, preset_id)?;
-    let size_bytes = frames
-        .iter()
-        .filter_map(|path| path.metadata().ok())
-        .map(|metadata| metadata.len())
-        .sum();
+    let size_bytes = estimate_sequence_size_bytes(frames);
     let (start_number, end_number) = (
         sequence_key(first).map(|(_, frame)| frame).unwrap_or(0),
         frames
@@ -751,10 +801,9 @@ fn probe_sequence(frames: &[PathBuf], preset_id: &str, fps: f64) -> Result<Queue
     item.sequence_frame_count = frames.len() as u32;
     item.sequence_fps = fps;
     item.sequence_pixel_aspect = default_pixel_aspect();
-    item.sequence_frames = frames
-        .iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect();
+    // Do not materialize the full path list during import. It is reconstructed
+    // backend-side immediately before encoding.
+    item.sequence_frames.clear();
     item.audio_tracks = 0;
     item.subtitle_tracks = 0;
     item.is_panorama = false;
@@ -798,15 +847,16 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
     let exe_dir = executable_dir_path()?;
     let jobs = jobs
         .into_iter()
-        .map(|mut job| {
+        .map(|mut job| -> Result<EncodeJob, String> {
             if job.preset.lut_enabled && !job.preset.lut_name.trim().is_empty() {
                 job.preset.lut_name = resolve_stored_lut_path(&exe_dir, &job.preset.lut_name)
                     .to_string_lossy()
                     .to_string();
             }
-            job
+            hydrate_sequence_frames(&mut job.item)?;
+            Ok(job)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     preflight_jobs(&jobs)?;
     let session_id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -852,16 +902,9 @@ fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
         if !source.is_file() {
             return Err(format!("源媒体不存在：{}", source.display()));
         }
-        if job.item.media_kind == "sequence"
-            && (job.item.sequence_frames.is_empty()
-                || job
-                    .item
-                    .sequence_frames
-                    .iter()
-                    .any(|frame| !Path::new(frame).is_file()))
-        {
+        if job.item.media_kind == "sequence" && job.item.sequence_frames.is_empty() {
             return Err(format!(
-                "序列“{}”包含缺失帧，请重新载入",
+                "序列“{}”没有可用帧，请重新载入",
                 job.item.file_name
             ));
         }
@@ -4860,12 +4903,23 @@ mod tests {
         let groups = collect_sequence_groups(vec![selected.to_string_lossy().to_string()]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 3);
-        let item = probe_sequence(&groups[0], "sequence-preset", 24.0).unwrap();
+        let mut item = probe_sequence(&groups[0], "sequence-preset", 24.0).unwrap();
         assert_eq!(item.media_kind, "sequence");
         assert_eq!(item.sequence_pattern, "shot_%04d_left.png");
         assert_eq!(item.sequence_frame_count, 3);
         assert_eq!(item.file_name, "shot_left [1–3].png");
         assert_eq!(item.fps, "24 fps");
+        assert!(
+            item.sequence_frames.is_empty(),
+            "sequence import must not materialize every frame path"
+        );
+        let wire_value = serde_json::to_value(&item).unwrap();
+        assert!(
+            wire_value.get("sequenceFrames").is_none(),
+            "frame paths must not cross Tauri IPC"
+        );
+        hydrate_sequence_frames(&mut item).unwrap();
+        assert_eq!(item.sequence_frames.len(), 3);
 
         let mut preset = preset_with_defaults("sequence-preset", "Sequence", "h264", "_encoded");
         preset.hardware = "cpu".into();
