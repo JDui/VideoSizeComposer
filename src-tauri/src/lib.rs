@@ -1449,6 +1449,15 @@ fn executable_dir_path() -> Result<PathBuf, String> {
 
 fn portable_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let exe_dir = executable_dir_path()?;
+    if cfg!(target_os = "macos") {
+        let config = app
+            .path()
+            .app_config_dir()
+            .map_err(|error| format!("无法读取配置目录：{error}"))?;
+        initialize_portable_config(&config, &exe_dir.join("config"), &exe_dir)
+            .map_err(|error| format!("无法创建配置目录 {}：{error}", config.display()))?;
+        return Ok(config);
+    }
     let config = exe_dir.join("config");
     if config.exists() {
         if !config.is_dir() {
