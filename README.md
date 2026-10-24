@@ -35,7 +35,10 @@ VideoSize Composer 是一个便携式桌面批量视频编码器。它使用 Tau
 - Dolby Vision 保留模式使用无损 HEVC stream copy 保留已有 RPU；该模式不允许缩放或 LUT 处理，也不会生成新的 Dolby Vision 元数据。
 - 可导入 `.cube`、`.3dl` 和 `.lut` 文件，并将 LUT 与预设一起保存。
 - 识别带全景标签的源视频和 2:1 等距柱状候选；全景输出写入 Google Spherical Video V1 与标准 V2 `st3d`/`sv3d` 元数据，并通过 ffprobe 回读验证。
+- 支持导入 Insta360 `.insv`，自动配对旧机型的 `_00_` / `_10_` 双原片并合并为一个任务。预设的“全景”页可保存 FlowState 防抖、方向锁定、光流／动态／AI 拼接、镜头间色彩融合及降噪偏好。
+- INSV 视频导出需要另行部署官方 Desktop Media SDK：先由 SDK 拼接为 2:1 全景中间视频，再按输出预设编码为所选格式；“跟随源文件”对 INSV 默认使用 MP4（ProRes 使用 MOV）。不输出可继续编辑的 INSV 原片。
 - 可保存、编辑和删除“我的预设”；预设库与右侧当前任务的输出设置相互独立。
+- 预设侧栏采用紧凑分组，可搜索名称、编码与参数并记忆折叠状态；任务设置和预设编辑器统一为“常用 / 色彩 / 输出”三个页签，支持码率数值输入和命名预览。
 - 可选择全部输出到指定目录、原位输出或原位子文件夹，并支持原名或前后缀命名。
 - 默认保留源视频的创建日期和修改时间；Windows 与 macOS 会分别写入并回读验证。
 - 启动编码前检查输出目录可写性和剩余空间；重名文件使用可预测的数字后缀处理。
@@ -87,6 +90,18 @@ pnpm build:portable
 ```
 
 Windows 便携版会生成到 `dist/VideoSizeComposer`，直接运行其中的 `VideoSizeComposer.exe`。最终打包步骤会把 FFmpeg 和 ffprobe 放在应用旁边。
+
+### Insta360 SDK 部署
+
+官方 SDK 需要通过 [Insta360 开发者申请](https://www.insta360.com/sdk/apply) 审核后获得下载链接；公开 GitHub 仓库只有示例与文档。已安装的 Insta360 Studio 不等于安装了独立 Media SDK。
+
+使用带 `-model_root_dir` 参数的新版官方 `MediaSDKTest`，将 Windows SDK 的完整 `bin/` 内容（可执行程序、依赖 DLL、`models/`）放到便携程序旁的 `insta360/` 目录，也可在“应用设置 → Insta360 全景处理”中选择 SDK 根目录或 `bin/`。支持通过 `INSTA360_MEDIA_SDK_DIR` 环境变量指定目录。开发时可将完整 bin 内容放入 `vendor/insta360/`，构建脚本会复制到便携包；SDK 不提交到仓库。
+
+防抖、方向锁定、拼接与降噪仅对 INSV 原片生效，普通全景 MP4 不会重复拼接。AI 拼接和降噪需要 SDK 配套模型，部分功能还受拍摄机型及 SDK 版本限制。官方桌面 Media SDK 支持 Windows/Linux，当前 macOS 需先通过 Studio 导出全景 MP4。SDK 的运行环境及参数以 [官方文档](https://insta360develop.github.io/Insta360-Developer_Docs/en/x/desktop/media/) 为准。
+
+拼接使用原全景尺寸和至少 80 Mbps 的 HEVC 中间视频，再进行最终编码，会增加一次有损编码与临时空间占用。预检查同时计算中间文件空间，拼接输出会核对尺寸、时长、位深、HDR 和音轨；失败或取消清理中间文件，不会将未拼接的鱼眼画面当成成功输出。自定义全景输出尺寸必须是 2:1，宽为 4 的倍数。MP4/MOV/M4V 写入并回读验证全景标记，其他封装的播放器识别需另行确认。
+
+验证边界：自动测试以人工构造的多视频轨 MP4/INSV 验证配对、队列参数、转码、全景标记及 SDK 进程取消；不代表真实相机标定、FlowState 或 AI 拼接画质已经验收，仍需官方 SDK 与真实 INSV 样片验证。
 
 macOS `.app` 包请在 macOS 上构建：
 

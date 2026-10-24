@@ -1,6 +1,7 @@
 node_modules/
 dist/
 portable/
+vendor/insta360/
 src-tauri/target/
 .vite/
 *.log

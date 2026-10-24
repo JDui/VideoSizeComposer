@@ -20,6 +20,14 @@ export interface ToolStatus {
   ffprobe: string;
   encoders: string[];
   ok: boolean;
+  insta360Sdk?: string;
+}
+
+export interface PanoramaPreferences {
+  stabilization: "off" | "flowstate" | "direction_lock";
+  stitching: "optflow" | "dynamicstitch" | "aistitch";
+  stitchFusion: boolean;
+  denoise: boolean;
 }
 
 export interface Preset {
@@ -40,11 +48,13 @@ export interface Preset {
   outputMode: OutputMode;
   outputDir: string;
   outputContainer: OutputContainer;
+  wavEncoding: "pcm16" | "pcm24" | "float32";
   namingMode: NamingMode;
   prefix: string;
   suffix: string;
   keepTimes: boolean;
   keepPanorama: boolean;
+  panorama: PanoramaPreferences;
   alphaBackground: AlphaBackground;
   colorSpace: "source" | "rec709" | "rec2020";
   hdrMode: HdrMode;
@@ -115,6 +125,7 @@ export interface EncodeProgress {
 }
 
 export interface AppPreferences {
+  theme: import("./theme").ThemeColors;
   defaultHardware: Hardware;
   defaultOutputMode: OutputMode;
   defaultOutputDir: string;
@@ -122,4 +133,5 @@ export interface AppPreferences {
   confirmBeforeClear: boolean;
   autoOpenDetails: boolean;
   defaultSequenceFps: number;
+  insta360SdkPath: string;
 }

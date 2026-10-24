@@ -1,0 +1,48 @@
+const { chromium } = require('playwright');
+const assert = require('node:assert/strict');
+(async () => {
+ const browser = await chromium.launch({headless:true, channel:"msedge"});
+ const page = await browser.newPage({viewport:{width:1180,height:760}});
+ const errors=[]; page.on('pageerror', e=>errors.push(String(e)));
+ const bg=()=>page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--theme-background').trim());
+ await page.goto('http://127.0.0.1:1421');
+ await page.getByRole('button',{name:'设置',exact:true}).click();
+ assert.equal(await bg(),'#111116');
+ await page.getByRole('button',{name:'银白紫罗兰',exact:true}).click();
+ assert.equal(await bg(),'#edeef2');
+ assert.equal(await page.evaluate(()=>document.documentElement.style.colorScheme),'light');
+ const ink=await page.locator('.primary-button').evaluate(el=>getComputedStyle(el).color);
+ assert.equal(ink,'rgb(255, 255, 255)');
+ await page.screenshot({path:'qa/theme/light-settings.png'});
+ await page.locator('.modal-card header button').click();
+ assert.equal(await bg(),'#111116');
+ await page.getByRole('button',{name:'设置',exact:true}).click();
+ await page.getByRole('button',{name:'深海青蓝',exact:true}).click();
+ await page.getByLabel('窗口背景',{exact:true}).fill('#20152e');
+ await page.getByLabel('操作按钮',{exact:true}).fill('#f0a0ce');
+ assert.equal(await bg(),'#20152e');
+ await page.getByRole('button',{name:'保存设置',exact:true}).click();
+ await page.reload();
+ await page.getByRole('button',{name:'设置',exact:true}).click();
+ assert.equal(await bg(),'#20152e');
+ assert.equal(await page.getByLabel('操作按钮',{exact:true}).inputValue(),'#f0a0ce');
+ assert(await page.getByText('自定义配色',{exact:true}).isVisible());
+ await page.getByRole('button',{name:'恢复爱蜜莉雅紫',exact:true}).click();
+ assert.equal(await bg(),'#111116');
+ await page.screenshot({path:'qa/theme/emilia-settings.png'});
+ await page.getByRole('button',{name:'保存设置',exact:true}).click();
+ await page.screenshot({path:'qa/theme/emilia-workbench.png'});
+ // Existing settings without theme must retain all unrelated preferences.
+ await page.evaluate(()=>localStorage.setItem('videosize-composer.preferences.v1',JSON.stringify({defaultSequenceFps:24,confirmBeforeClear:false})));
+ await page.reload();
+ await page.getByRole('button',{name:'设置',exact:true}).click();
+ assert.equal(await bg(),'#111116');
+ assert.equal(await page.locator('input[type=number]').last().inputValue(),'24');
+ const layout=await page.evaluate(()=>({width:innerWidth, document:document.documentElement.scrollWidth,modal:document.querySelector('.modal-card').getBoundingClientRect().toJSON()}));
+ assert.equal(layout.width,layout.document);
+ assert(layout.modal.x>=0 && layout.modal.y>=0 && layout.modal.bottom<=760);
+ assert.deepEqual(errors,[]);
+ console.log(JSON.stringify({passed:['default Emilia','light preset and button contrast','cancel restores theme','custom colors save and reload','restore default','legacy settings migration','1180x760 layout'],layout,errors},null,2));
+ await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});
+

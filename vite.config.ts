@@ -6,10 +6,12 @@ export default defineConfig({
   clearScreen: false,
   server: {
     port: 1420,
-    strictPort: true
+    strictPort: true,
+    watch: { ignored: ["**/src-tauri/**", "**/dist/**", "**/vendor/**"] }
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
+    outDir: "dist/web",
     target: "es2020",
     minify: false,
     sourcemap: true

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { defaultTheme, normalizeTheme } from "./theme";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { AppPreferences, EncodeJob, EncodeProgress, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
@@ -8,13 +9,15 @@ const browserPresetsKey = "videosize-composer.presets.v1";
 const preferencesKey = "videosize-composer.preferences.v1";
 
 export const defaultPreferences: AppPreferences = {
+  theme: defaultTheme,
   defaultHardware: "auto",
   defaultOutputMode: "subfolder",
   defaultOutputDir: "",
   keepTimesByDefault: true,
   confirmBeforeClear: true,
   autoOpenDetails: true,
-  defaultSequenceFps: 30
+  defaultSequenceFps: 30,
+  insta360SdkPath: ""
 };
 
 export async function getPlatformInfo(): Promise<PlatformInfo> {
@@ -78,7 +81,7 @@ export async function pickVideoFiles(): Promise<string[]> {
   const result = await open({
     multiple: true,
     directory: false,
-    filters: [{ name: "视频与音频媒体", extensions: ["mp4", "mov", "mkv", "mxf", "avi", "webm", "m4v", "mts", "m2ts", "3gp", "3g2", "mpeg", "mpg", "ts", "wmv", "flv", "ogv", "wav", "mp3", "flac", "aac", "m4a", "ogg", "opus", "wma", "aif", "aiff", "ac3", "eac3"] }]
+    filters: [{ name: "视频与音频媒体", extensions: ["insv", "mp4", "mov", "mkv", "mxf", "avi", "webm", "m4v", "mts", "m2ts", "3gp", "3g2", "mpeg", "mpg", "ts", "wmv", "flv", "ogv", "wav", "mp3", "flac", "aac", "m4a", "ogg", "opus", "wma", "aif", "aiff", "ac3", "eac3"] }]
   });
   if (!result) return [];
   return Array.isArray(result) ? result : [result];
@@ -200,11 +203,18 @@ export function normalizePreset(preset: Partial<Preset>): Preset {
     outputMode: preset.outputMode ?? "subfolder",
     outputDir: preset.outputDir ?? "",
     outputContainer: preset.outputContainer ?? (preset.codec === "prores" ? "mov" : "source"),
+    wavEncoding: preset.wavEncoding === "pcm24" || preset.wavEncoding === "float32" ? preset.wavEncoding : "pcm16",
     namingMode: preset.namingMode ?? "suffix_prefix",
     prefix: preset.prefix ?? "",
     suffix: isLegacyProResDefault && preset.suffix === "_prores422" ? "_prores422lt" : preset.suffix ?? "_compressed",
     keepTimes: preset.keepTimes ?? true,
     keepPanorama: preset.keepPanorama ?? true,
+    panorama: {
+      stabilization: preset.panorama?.stabilization === "off" || preset.panorama?.stabilization === "direction_lock" ? preset.panorama.stabilization : "flowstate",
+      stitching: preset.panorama?.stitching === "dynamicstitch" || preset.panorama?.stitching === "aistitch" ? preset.panorama.stitching : "optflow",
+      stitchFusion: preset.panorama?.stitchFusion ?? true,
+      denoise: preset.panorama?.denoise ?? false
+    },
     alphaBackground: preset.alphaBackground === "black" || preset.alphaBackground === "white" ? preset.alphaBackground : "checkerboard",
     colorSpace: preset.colorSpace ?? "source",
     hdrMode: preset.hdrMode ?? "source",
@@ -220,6 +230,7 @@ export function normalizePreset(preset: Partial<Preset>): Preset {
 function normalizePreferences(preferences: Partial<AppPreferences>): AppPreferences {
   const defaultSequenceFps = Number(preferences.defaultSequenceFps);
   return {
+    theme: normalizeTheme(preferences.theme),
     defaultHardware: preferences.defaultHardware === "cuda" || preferences.defaultHardware === "metal" || preferences.defaultHardware === "cpu"
       ? preferences.defaultHardware
       : "auto",
@@ -227,6 +238,7 @@ function normalizePreferences(preferences: Partial<AppPreferences>): AppPreferen
       ? preferences.defaultOutputMode
       : "subfolder",
     defaultOutputDir: typeof preferences.defaultOutputDir === "string" ? preferences.defaultOutputDir : "",
+    insta360SdkPath: typeof preferences.insta360SdkPath === "string" ? preferences.insta360SdkPath : "",
     keepTimesByDefault: preferences.keepTimesByDefault ?? defaultPreferences.keepTimesByDefault,
     confirmBeforeClear: preferences.confirmBeforeClear ?? defaultPreferences.confirmBeforeClear,
     autoOpenDetails: preferences.autoOpenDetails ?? defaultPreferences.autoOpenDetails,

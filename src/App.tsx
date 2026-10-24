@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import packageMetadata from "../package.json";
+import appIcon from "../assets/app-icon.png";
+import { applyTheme } from "./theme";
+import { ThemeSettings } from "./ThemeSettings";
 import {
   Check,
-  CheckCircle2,
   ChevronDown,
   ChevronRight,
   CircleAlert,
@@ -24,6 +26,7 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  MoreHorizontal,
   Square,
   Trash2,
   X,
@@ -55,36 +58,11 @@ import {
   savePreferences,
   startEncode
 } from "./tauri";
-import type { AlphaBackground, AppPreferences, Codec, EncodeJob, FpsMode, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
+import type { AppPreferences, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
+import { codecLabels, OutputSettings, presetSummary } from "./OutputSettings";
 
 const defaultPlatform: PlatformInfo = { os: "unknown", accelerators: ["auto", "cpu"] };
 const defaultToolStatus: ToolStatus = { ffmpeg: "检测中", ffprobe: "检测中", encoders: [], ok: false };
-
-const codecLabels: Record<Codec, string> = {
-  h265: "HEVC (H.265)",
-  h264: "H.264 (AVC)",
-  av1: "AV1",
-  prores: "ProRes 422 LT"
-};
-
-const commonFpsOptions = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
-
-const fpsLabels: Record<FpsMode, string> = {
-  source: "保持原帧率",
-  preset: "常见帧率",
-  custom: "自定义"
-};
-
-function fpsLabel(value: number) {
-  return `${value} fps`;
-}
-
-const presetDescriptions: Record<Codec, string> = {
-  h265: "高效压缩，保留 HDR 与 10bit 色深",
-  h264: "平衡画质与体积，广泛兼容",
-  av1: "开源格式，体积更小",
-  prores: "高画质，适合后期编辑"
-};
 
 const packageVersion = typeof packageMetadata.version === "string" && packageMetadata.version.trim()
   ? packageMetadata.version
@@ -142,15 +120,10 @@ export default function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [filter, setFilter] = useState("");
   const [presetFilter, setPresetFilter] = useState("");
-  const [advancedOpen, toggleAdvanced] = useToggleState("vsc.settings.advancedOpen", false);
-  const [postprocessOpen, togglePostprocess, setPostprocess] = useToggleState("vsc.settings.postprocessOpen", false);
-  const [deliveryOpen, toggleDelivery] = useToggleState("vsc.settings.deliveryOpen", true);
-  const [formatOpen, toggleFormat] = useToggleState("vsc.settings.formatOpen", true);
-  const [qualityOpen, toggleQuality] = useToggleState("vsc.settings.qualityOpen", true);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [mediaInfoItemId, setMediaInfoItemId] = useState("");
-  const [presetRailCollapsed, setPresetRailCollapsed] = useState(false);
-  const [presetListOpen, setPresetListOpen] = useState(true);
+  const [presetRailCollapsed, togglePresetRail] = useToggleState("vsc.presetRailCollapsed", false);
+  const [presetListOpen, togglePresetList] = useToggleState("vsc.presetListOpen", true);
   const [presetEditorOpen, setPresetEditorOpen] = useState(false);
   const [presetDraft, setPresetDraft] = useState<Preset>();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -159,9 +132,11 @@ export default function App() {
   const [sequenceImportOpen, setSequenceImportOpen] = useState(false);
   const [sequenceDraft, setSequenceDraft] = useState<QueueItem>();
   const [contextMenu, setContextMenu] = useState<ContextMenuState>();
-  const [qualityEditing, setQualityEditing] = useState(false);
   const [preferences, setPreferences] = useState<AppPreferences>(defaultPreferences);
   const [preferencesDraft, setPreferencesDraft] = useState<AppPreferences>(defaultPreferences);
+  useEffect(() => {
+    applyTheme(settingsOpen ? preferencesDraft.theme : preferences.theme);
+  }, [settingsOpen, preferencesDraft.theme, preferences.theme]);
   const [encodingIds, setEncodingIds] = useState<string[]>([]);
   const [isImporting, setIsImporting] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -176,6 +151,8 @@ export default function App() {
   const importInProgress = useRef(false);
   const cancellingRef = useRef<Set<string>>(new Set());
   const queueBodyRef = useRef<HTMLDivElement>(null);
+  const detailsControlRef = useRef<HTMLDivElement>(null);
+  const detailsButtonRef = useRef<HTMLButtonElement>(null);
   const selectionAnchorId = useRef("");
   const suppressRowClick = useRef(false);
   const marqueeStart = useRef<{
@@ -342,6 +319,30 @@ export default function App() {
     };
   }, [contextMenu]);
 
+  useEffect(() => {
+    if (!detailsOpen) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!detailsControlRef.current?.contains(event.target as Node)) setDetailsOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setDetailsOpen(false);
+      detailsButtonRef.current?.focus();
+    };
+    const closeOnFocusOutside = (event: FocusEvent) => {
+      if (!detailsControlRef.current?.contains(event.target as Node)) setDetailsOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOnPointerDown);
+    window.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("focusin", closeOnFocusOutside);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnPointerDown);
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("focusin", closeOnFocusOutside);
+    };
+  }, [detailsOpen]);
+
   useEffect(() => () => {
     if (simulationTimer.current !== null) window.clearInterval(simulationTimer.current);
   }, []);
@@ -493,13 +494,17 @@ export default function App() {
         selectionAnchorId.current = id;
       }
     }
+    const anchor = event.currentTarget.getBoundingClientRect();
+    const keyboardClick = event.type === "click" && event.detail === 0;
+    const clientX = keyboardClick ? anchor.right : event.clientX;
+    const clientY = keyboardClick ? anchor.bottom : event.clientY;
     const width = 208;
     const height = kind === "preset" ? 184 : 148;
     setContextMenu({
       kind,
       id,
-      left: Math.min(Math.max(8, event.clientX), Math.max(8, window.innerWidth - width - 8)),
-      top: Math.min(Math.max(8, event.clientY), Math.max(8, window.innerHeight - height - 8))
+      left: Math.min(Math.max(8, clientX), Math.max(8, window.innerWidth - width - 8)),
+      top: Math.min(Math.max(8, clientY), Math.max(8, window.innerHeight - height - 8))
     });
   }
 
@@ -539,7 +544,7 @@ export default function App() {
   }
 
   function togglePanorama(itemId: string) {
-    setQueue((items) => items.map((item) => item.id === itemId
+    setQueue((items) => items.map((item) => item.id === itemId && !/\.insv$/i.test(item.source)
       ? { ...item, isPanorama: !item.isPanorama }
       : item));
   }
@@ -590,7 +595,6 @@ export default function App() {
     const paths = await pickLutFiles();
     if (paths[0]) {
       updateActivePreset({ lutEnabled: true, lutName: paths[0] });
-      setPostprocess(true);
       setNotice("LUT 已加入当前预设");
     }
   }
@@ -626,6 +630,7 @@ export default function App() {
       return;
     }
     setPreferences(next);
+    getToolStatus().then(setToolStatus).catch(() => {});
     setPreferencesDraft(next);
     setSettingsOpen(false);
     setNotice("应用设置已保存");
@@ -645,14 +650,6 @@ export default function App() {
     if (preferences.confirmBeforeClear && !window.confirm("清空当前媒体列表？")) return;
     setQueue([]);
     setMediaInfoItemId("");
-  }
-
-  function applyCodec(codec: Codec) {
-    updateActivePreset(codecPatch(codec));
-  }
-
-  function applyHdrMode(hdrMode: Preset["hdrMode"]) {
-    updateActivePreset(hdrPatch(hdrMode, activePreset));
   }
 
   async function encodeSelected() {
@@ -841,14 +838,22 @@ export default function App() {
 
   const hardwareSummary = hardwareLabel(activePreset?.hardware ?? "auto", platform);
   const filteredPresets = presets.filter((preset) =>
-    preset.name.toLowerCase().includes(presetFilter.trim().toLowerCase())
+    `${preset.name} ${codecLabels[preset.codec]} ${presetSummary(preset)}`.toLowerCase().includes(presetFilter.trim().toLowerCase())
   );
+
+  const presetGroups = [
+    { id: "common", label: "日常压缩" },
+    { id: "hdr", label: "HDR 与色彩" },
+    { id: "editing", label: "后期编辑" }
+  ].map((group) => ({ ...group, items: filteredPresets.filter((preset) =>
+    (preset.codec === "prores" ? "editing" : ["hlg", "hdr10", "dolby_vision"].includes(preset.hdrMode) ? "hdr" : "common") === group.id
+  ) })).filter((group) => group.items.length);
 
   return (
     <main className="composer-shell" onDragOver={(event) => event.preventDefault()} onDrop={handleBrowserDrop(addPaths)}>
       <header className="titlebar">
         <div className="brand-lockup">
-          <span className="brand-mark"><Play size={25} /></span>
+          <img className="brand-mark" src={appIcon} alt="" aria-hidden="true" />
           <strong>VideoSize Composer <span className="brand-version">{functionVersion}</span></strong>
         </div>
         <div className="titlebar-actions">
@@ -861,25 +866,24 @@ export default function App() {
         <aside className={`preset-rail ${presetRailCollapsed ? "is-collapsed" : ""}`}>
           <div className="rail-heading">
             {!presetRailCollapsed && <><h2>预设</h2><button className="quiet-action" onClick={createPreset}><Plus size={16} />新建</button></>}
-            <button className="icon-only rail-collapse" aria-label={presetRailCollapsed ? "展开预设抽屉" : "折叠预设抽屉"} title={presetRailCollapsed ? "展开预设抽屉" : "折叠预设抽屉"} onClick={() => setPresetRailCollapsed((collapsed) => !collapsed)}>{presetRailCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}</button>
+            <button className="icon-only rail-collapse" aria-label={presetRailCollapsed ? "展开预设抽屉" : "折叠预设抽屉"} title={presetRailCollapsed ? "展开预设抽屉" : "折叠预设抽屉"} aria-expanded={!presetRailCollapsed} onClick={togglePresetRail}>{presetRailCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}</button>
           </div>
           {!presetRailCollapsed && <>
             <SearchField value={presetFilter} onChange={setPresetFilter} placeholder="搜索我的预设" />
 
-            <button className="preset-section-title" aria-expanded={presetListOpen} onClick={() => setPresetListOpen((open) => !open)}><span>我的预设 <small>{filteredPresets.length}</small></span><ChevronDown size={15} className={presetListOpen ? "rotated" : ""} /></button>
+            <button className="preset-section-title" aria-expanded={presetListOpen} onClick={togglePresetList}><span>我的预设 <small>{filteredPresets.length}</small></span><ChevronDown size={15} className={presetListOpen ? "rotated" : ""} /></button>
             {presetListOpen && <div className="preset-list">
-              {filteredPresets.map((preset) => (
-                <div key={preset.id} className={`preset-item ${preset.id === activePresetId ? "is-active" : ""}`} onContextMenu={(event) => openContextMenu("preset", preset.id, event)}>
-                  <button className="preset-apply" onClick={() => choosePreset(preset.id)}>
-                    <span className="preset-icon"><Film size={15} /></span>
-                    <span className="preset-copy"><strong>{preset.name}</strong><small>{presetDescriptions[preset.codec]}</small></span>
-                  </button>
-                  <span className="preset-actions">
-                    <button aria-label={`编辑 ${preset.name}`} title="编辑预设" onClick={() => editPreset(preset)}><Edit3 size={14} /></button>
-                    <button aria-label={`删除 ${preset.name}`} title="删除预设" className="danger" onClick={() => deleteSavedPreset(preset)}><Trash2 size={14} /></button>
-                  </span>
-                </div>
-              ))}
+              {presetGroups.map((group) => <section className="preset-group" key={group.id} aria-label={group.label}>
+                <h3>{group.label}<small>{group.items.length}</small></h3>
+                {group.items.map((preset) => (
+                  <div key={preset.id} className={`preset-item ${preset.id === activePresetId ? "is-active" : ""}`} onContextMenu={(event) => openContextMenu("preset", preset.id, event)}>
+                    <button className="preset-apply" title={`${preset.name}\n${codecLabels[preset.codec]} · ${presetSummary(preset)}`} aria-pressed={preset.id === activePresetId} onClick={() => choosePreset(preset.id)}>
+                      <span className="preset-copy"><strong>{preset.name}</strong><small>{presetSummary(preset)}</small></span>
+                    </button>
+                    <button className="preset-more icon-only" aria-label={`操作预设 ${preset.name}`} title="预设操作" aria-haspopup="menu" aria-expanded={contextMenu?.kind === "preset" && contextMenu.id === preset.id} onClick={(event) => openContextMenu("preset", preset.id, event)}><MoreHorizontal size={15} /></button>
+                  </div>
+                ))}
+              </section>)}
               {!filteredPresets.length && <span className="no-presets">没有匹配的预设，可点击“新建”创建。</span>}
             </div>}
 
@@ -927,6 +931,7 @@ export default function App() {
               {marquee && <span className="selection-marquee" style={marquee} aria-hidden="true" />}
               {visibleItems.length ? visibleItems.map((item, index) => {
                 const itemPreset = presetForItem(item, presets, activePreset);
+                const presetName = presetNameForItem(item, presets, activePreset, activePresetId);
                 const predicted = estimateOutputBytes(item, itemPreset);
                 const outputPath = item.output || (itemPreset ? previewOutput(item, itemPreset) : "");
                 return (
@@ -938,8 +943,8 @@ export default function App() {
                     onContextMenu={(event) => openContextMenu("media", item.id, event)}
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
-                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : item.mediaKind === "audio" ? <Zap size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : item.mediaKind === "audio" ? `音频 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small><button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}{item.mediaKind === "audio" && <label className="row-inline-control" title="音频素材输出视频时使用的画面模式" onClick={(event) => event.stopPropagation()}><span>画面</span><select value={item.audioVisual} onChange={(event) => updateAudioVisual(item.id, event.target.value as QueueItem["audioVisual"])}><option value="timecode">时间码</option><option value="black">纯黑</option><option value="white">纯白</option></select></label>}{item.mediaKind !== "audio" && item.audioTracks === 0 && <button className="audio-attach-control" title={item.externalAudio || "添加外接音频"} onClick={(event) => { event.stopPropagation(); chooseExternalAudio(item.id); }}>{item.externalAudio ? `已添加音频 · ${shortPath(item.externalAudio)}` : "无音轨 · 添加音频"}</button>}{item.externalAudio && item.mediaKind !== "audio" && <button className="audio-clear-control" aria-label="清除外接音频" title="清除外接音频" onClick={(event) => { event.stopPropagation(); clearExternalAudio(item.id); }}><X size={11} /></button>}</span></div>
-                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.mediaKind === "audio" ? "纯音频" : `${item.bitDepth || 8}-bit · 4:2:${item.chroma.slice(-1)}`} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.exportAlphaMask && <em>Alpha 遮罩已启用</em>}{item.mediaKind === "audio" && <em>音频素材</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}{item.mediaKind !== "audio" && <button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} title="点击切换全景状态" onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button>}</span>{item.hasAlpha && item.mediaKind !== "audio" && <label className="alpha-mask-control" title="从源 Alpha 通道生成独立黑白视频" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={item.exportAlphaMask} onChange={(event) => toggleAlphaMask(item.id, event.target.checked)} /><span>单独导出 Alpha 遮罩</span></label>}</div>
+                    <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : item.mediaKind === "audio" ? <Zap size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : item.mediaKind === "audio" ? `音频 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small>{presetName && <span className="media-preset" title={`使用预设：${presetName}`}>预设：{presetName}</span>}<button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}{item.mediaKind === "audio" && <label className="row-inline-control" title="音频素材输出视频时使用的画面模式" onClick={(event) => event.stopPropagation()}><span>画面</span><select value={item.audioVisual} onChange={(event) => updateAudioVisual(item.id, event.target.value as QueueItem["audioVisual"])}><option value="timecode">时间码</option><option value="black">纯黑</option><option value="white">纯白</option></select></label>}{item.mediaKind !== "audio" && item.audioTracks === 0 && <button className="audio-attach-control" title={item.externalAudio || "添加外接音频"} onClick={(event) => { event.stopPropagation(); chooseExternalAudio(item.id); }}>{item.externalAudio ? `已添加音频 · ${shortPath(item.externalAudio)}` : "无音轨 · 添加音频"}</button>}{item.externalAudio && item.mediaKind !== "audio" && <button className="audio-clear-control" aria-label="清除外接音频" title="清除外接音频" onClick={(event) => { event.stopPropagation(); clearExternalAudio(item.id); }}><X size={11} /></button>}</span></div>
+                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.mediaKind === "audio" ? "纯音频" : `${item.bitDepth || 8}-bit · 4:2:${item.chroma.slice(-1)}`} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.exportAlphaMask && <em>Alpha 遮罩已启用</em>}{item.mediaKind === "audio" && <em>音频素材</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}{item.mediaKind !== "audio" && <button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} disabled={/\.insv$/i.test(item.source)} title={/\.insv$/i.test(item.source) ? "INSV 原片必须先进行全景拼接" : "点击切换全景状态"} onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button>}</span>{item.hasAlpha && item.mediaKind !== "audio" && <label className="alpha-mask-control" title="从源 Alpha 通道生成独立黑白视频" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={item.exportAlphaMask} onChange={(event) => toggleAlphaMask(item.id, event.target.checked)} /><span>单独导出 Alpha 遮罩</span></label>}</div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
                     <StatusCell item={item} outputPath={outputPath} onRevealPath={revealItemPath} />
                     <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); openMediaInfo(item); }}><ChevronRight size={19} /></button>
@@ -956,81 +961,19 @@ export default function App() {
             </footer>
           </section>
 
-          {detailsOpen && (
-            <section className="details-drawer" aria-live="polite">
-              <div><strong>{isEncoding ? "正在压缩" : completedCount ? "最近一次任务" : "任务详情"}</strong><span>完成 {completedCount} · 失败 {failedCount} · 总计 {queue.length}</span></div>
-              <div className="details-log">{lastError || log[0] || "等待任务"}</div>
-              <button className="quiet-action" onClick={() => setDetailsOpen(false)}>收起</button>
-            </section>
-          )}
         </section>
 
-        <aside className="settings-panel">
-          <div className="settings-heading"><span><h2>输出设置</h2><small>仅影响当前任务</small></span><button className="quiet-action" onClick={createPreset}><Plus size={15} />另存为预设</button></div>
-          <Setting label="应用预设"><select value={activePresetId} onChange={(event) => choosePreset(event.target.value)}>{!activePresetId && <option value="">自定义设置</option>}{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></Setting>
-
-          <button className="collapse-row" onClick={toggleFormat}><span>输出格式</span><ChevronDown size={17} className={formatOpen ? "rotated" : ""} /></button>
-          {formatOpen && <div className="format-settings">
-            <Setting label="格式"><select value={activePreset?.codec ?? "h265"} onChange={(event) => applyCodec(event.target.value as Codec)}>{Object.entries(codecLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
-            <Setting label="封装格式"><select value={activePreset?.outputContainer ?? "source"} onChange={(event) => updateActivePreset({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名（序列/音频默认 MP4）</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A（仅音频）</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
-            <div className="settings-pair">
-              <Setting label="色深"><select value={activePreset?.bitDepth ?? "source"} onChange={(event) => updateActivePreset({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">原视频参数</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Setting>
-              <Setting label="色度采样"><select value={activePreset?.chroma ?? "source"} onChange={(event) => updateActivePreset({ chroma: event.target.value as Preset["chroma"] })}><option value="source">原视频参数</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Setting>
-            </div>
-          </div>}
-
-          <button className="collapse-row" onClick={toggleQuality}><span>画质</span><ChevronDown size={17} className={qualityOpen ? "rotated" : ""} /></button>
-          {qualityOpen && <div className="quality-settings">
-            <Setting label="尺寸"><select value={resolutionValue(activePreset)} onChange={(event) => applyResolution(event.target.value, updateActivePreset)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="scale">缩放至倍率</option><option value="custom">自定义</option></select></Setting>
-            {activePreset?.resolutionMode === "scale_percent" && <label className="range-setting"><span>缩放倍率 <strong>{activePreset.scalePercent}%</strong></span><input type="range" min={10} max={90} value={activePreset.scalePercent} onChange={(event) => updateActivePreset({ scalePercent: Number(event.target.value) })} /><small><span>10%</span><span>90%</span></small></label>}
-            {activePreset?.resolutionMode === "custom" && <div className="dimension-grid"><Setting label="宽"><input type="number" min={2} value={activePreset.customWidth} onChange={(event) => updateActivePreset({ customWidth: Number(event.target.value) })} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={activePreset.customHeight} onChange={(event) => updateActivePreset({ customHeight: Number(event.target.value) })} /></Setting></div>}
-            <Setting label="帧率"><select value={activePreset?.fpsMode ?? "source"} onChange={(event) => updateActivePreset({ fpsMode: event.target.value as FpsMode })}>{Object.entries(fpsLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
-            {activePreset?.fpsMode === "preset" && <Setting label="目标帧率"><select value={activePreset.fpsValue} onChange={(event) => updateActivePreset({ fpsValue: Number(event.target.value) })}>{commonFpsOptions.map((fps) => <option key={fps} value={fps}>{fpsLabel(fps)}</option>)}</select></Setting>}
-            {activePreset?.fpsMode === "custom" && <Setting label="目标帧率"><input type="number" min={0.001} step={0.001} value={activePreset.fpsValue} onChange={(event) => updateActivePreset({ fpsValue: Number(event.target.value) })} /></Setting>}
-            <Setting label="画质模式"><select value={activePreset?.bitrateMode ?? "source_multiplier"} onChange={(event) => updateActivePreset({ bitrateMode: event.target.value as Preset["bitrateMode"] })}><option value="source_multiplier">智能压缩</option><option value="target_mbps">指定码率</option></select></Setting>
-            <label className="range-setting"><span>预计码率 {qualityEditing
-              ? <input className="inline-number-editor" autoFocus type="number" step={activePreset?.bitrateMode === "target_mbps" ? .01 : .1} value={activePreset?.bitrateMode === "target_mbps" ? activePreset.targetBitrateMbps : Number(((activePreset?.bitrateMultiplier ?? .3) * 100).toFixed(2))} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} onBlur={() => setQualityEditing(false)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === "Escape") setQualityEditing(false); }} />
-              : <strong title="双击手动输入" onDoubleClick={() => setQualityEditing(true)}>{activePreset?.bitrateMode === "target_mbps" ? `${activePreset.targetBitrateMbps} Mbps` : `${Number(((activePreset?.bitrateMultiplier ?? .3) * 100).toFixed(2))}% 源码率`}</strong>}</span><input type="range" min={activePreset?.bitrateMode === "target_mbps" ? .1 : 1} max={activePreset?.bitrateMode === "target_mbps" ? 150 : 95} step={activePreset?.bitrateMode === "target_mbps" ? .1 : 1} value={activePreset?.bitrateMode === "target_mbps" ? Math.min(150, Math.max(.1, activePreset.targetBitrateMbps)) : Math.min(95, Math.max(1, Math.round((activePreset?.bitrateMultiplier ?? .3) * 100)))} onChange={(event) => activePreset?.bitrateMode === "target_mbps" ? updateActivePreset({ targetBitrateMbps: Number(event.target.value) }) : updateActivePreset({ bitrateMultiplier: Number(event.target.value) / 100 })} /><small><span>{activePreset?.bitrateMode === "target_mbps" ? "0.1 Mbps" : "1%"}</span><span>{activePreset?.bitrateMode === "target_mbps" ? "150 Mbps" : "95%"}</span></small></label>
-          </div>}
-
-          <label className="time-preservation-card">
-            <input type="checkbox" checked={activePreset?.keepTimes ?? true} onChange={(event) => updateActivePreset({ keepTimes: event.target.checked })} />
-            <Clock3 size={17} />
-            <span><strong>保留原始时间</strong><small>同时恢复创建日期和修改时间</small></span>
-            <CheckCircle2 size={16} className={activePreset?.keepTimes ? "is-on" : ""} />
-          </label>
-
-          <button className="collapse-row" onClick={toggleAdvanced}><span>高级选项</span><ChevronDown size={17} className={advancedOpen ? "rotated" : ""} /></button>
-          {advancedOpen && <div className="advanced-settings">
-            <div className="settings-pair">
-              <Setting label="硬件"><select value={activePreset?.hardware ?? "auto"} onChange={(event) => updateActivePreset({ hardware: event.target.value as Hardware })}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
-              <Setting label="色彩空间"><select value={activePreset?.colorSpace ?? "source"} onChange={(event) => updateActivePreset({ colorSpace: event.target.value as Preset["colorSpace"] })}><option value="source">跟随源文件</option><option value="rec709">Rec.709</option><option value="rec2020">Rec.2020</option></select></Setting>
-            </div>
-            <Setting label="HDR"><select value={activePreset?.hdrMode ?? "source"} onChange={(event) => applyHdrMode(event.target.value as Preset["hdrMode"])}><option value="source">跟随源文件</option><option value="sdr">SDR / Rec.709</option><option value="hlg">HLG / Rec.2100</option><option value="hdr10">HDR10 / PQ</option><option value="dolby_vision">杜比视界（保留源流）</option></select></Setting>
-            <label className="inline-check"><input type="checkbox" checked={activePreset?.keepPanorama ?? true} onChange={(event) => updateActivePreset({ keepPanorama: event.target.checked })} /><span>识别并保留全景元数据</span></label>
-            <label className="inline-check"><input type="checkbox" checked={activePreset?.cpuFallback ?? true} onChange={(event) => updateActivePreset({ cpuFallback: event.target.checked })} /><span>硬件失败时回退 CPU</span></label>
-            {activePreset?.hdrMode === "dolby_vision" && <div className="source-color-note"><ShieldCheck size={15} />杜比视界模式无损复制 HEVC 视频流，保留源 RPU；不可同时缩放或套 LUT。</div>}
-          </div>}
-
-          <button className="collapse-row has-subtitle" onClick={togglePostprocess}><span><strong>后处理</strong><small>{activePreset?.lutEnabled ? `${shortPath(activePreset.lutName)} · ${activePreset.lutIntensity}%` : "LUT / 全景元数据"} · Alpha 背景：{alphaBackgroundLabel(activePreset?.alphaBackground)}</small></span><ChevronDown size={17} className={postprocessOpen ? "rotated" : ""} /></button>
-          {postprocessOpen && <div className="postprocess-settings">
-            <Setting label="Alpha 背景"><select value={activePreset?.alphaBackground ?? "checkerboard"} onChange={(event) => updateActivePreset({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Setting>
-            <small className="field-note">仅含 Alpha 通道的视频会将所选背景实际合成到输出。</small>
-            <label className="inline-check"><input type="checkbox" checked={activePreset?.lutEnabled ?? false} onChange={(event) => updateActivePreset({ lutEnabled: event.target.checked })} /><span>启用 LUT</span></label>
-            <button className="secondary-button full" onClick={chooseLut}><FilePlus2 size={15} />{activePreset?.lutName ? shortPath(activePreset.lutName) : "选择 .cube / .3dl / .lut"}</button>
-            <label className="range-setting"><span>LUT 强度 <strong>{activePreset?.lutIntensity ?? 80}%</strong></span><input type="range" min={0} max={100} value={activePreset?.lutIntensity ?? 80} onChange={(event) => updateActivePreset({ lutIntensity: Number(event.target.value) })} /></label>
-          </div>}
-
-          <button className="collapse-row" onClick={toggleDelivery}><span>输出与命名</span><ChevronDown size={17} className={deliveryOpen ? "rotated" : ""} /></button>
-          {deliveryOpen && <div className="delivery-settings">
-            <Setting label="输出策略"><select value={activePreset?.outputMode ?? "subfolder"} onChange={(event) => updateActivePreset({ outputMode: event.target.value as Preset["outputMode"] })}><option value="single_folder">全部到同一目录</option><option value="in_place">原位导出</option><option value="subfolder">原位子文件夹</option></select></Setting>
-            <Setting label="命名"><select value={activePreset?.namingMode ?? "suffix_prefix"} onChange={(event) => updateActivePreset({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
-            {activePreset?.namingMode === "suffix_prefix" && <div className="naming-grid"><Setting label="前缀"><input value={activePreset.prefix} onChange={(event) => updateActivePreset({ prefix: event.target.value })} placeholder="可选" /></Setting><Setting label="后缀"><input value={activePreset.suffix} onChange={(event) => updateActivePreset({ suffix: event.target.value })} placeholder="_compressed" /></Setting></div>}
-          </div>}
-
-          <div className="settings-spacer" />
-          <button className="folder-summary" onClick={chooseOutputFolder}><span><small>输出位置</small><strong>{shortPath(outputDirectory(activePreset))}</strong></span><FolderOpen size={17} /></button>
-          <div className="space-check"><CheckCircle2 size={15} /><span>启动时检查可写性、空间与重名</span></div>
+        <aside className="settings-panel" aria-label="当前任务输出设置">
+          <div className="settings-heading"><span><h2>输出设置</h2><small>用于当前选中的媒体</small></span><button className="quiet-action" onClick={createPreset}><Plus size={15} />存为预设</button></div>
+          <div className="current-preset">
+            <Setting label="应用预设"><select value={activePresetId} onChange={(event) => choosePreset(event.target.value)}>{!activePresetId && <option value="">自定义设置</option>}{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></Setting>
+            {activePreset && <small className="current-output-summary" title={presetSummary(activePreset)}>{presetSummary(activePreset)}</small>}
+          </div>
+          {activePreset && <OutputSettings preset={activePreset} platform={platform} onChange={updateActivePreset} onChooseLut={chooseLut} onChooseOutput={chooseOutputFolder} />}
+          <div className="settings-footer">
+            <button className="folder-summary" title={outputDirectory(activePreset)} onClick={chooseOutputFolder}><span><small>输出位置</small><strong>{shortPath(outputDirectory(activePreset))}</strong></span><FolderOpen size={17} /></button>
+            <div className="space-check"><ShieldCheck size={14} /><span>{activePreset?.keepTimes ? "保留原始时间 · " : ""}自动检查空间与重名</span></div>
+          </div>
         </aside>
       </section>
 
@@ -1042,9 +985,17 @@ export default function App() {
           </div> : <><span>{selectedItems.length} 个文件</span><span>{formatBytes(totalSourceSize)} → <strong>{formatBytes(totalEstimatedSize)}</strong></span></>}
           <span className="hardware-pill"><Zap size={14} />{hardwareSummary}</span>
         </div>
-        {isEncoding
-          ? <button className="cancel-button" onClick={cancelCurrentEncoding}><Square size={15} />取消任务</button>
-          : <button className="review-button" onClick={() => setDetailsOpen((open) => !open)}>查看详情<ChevronRight size={16} /></button>}
+        <div className="details-control" ref={detailsControlRef}>
+          <button className="review-button" ref={detailsButtonRef} aria-haspopup="dialog" aria-expanded={detailsOpen} aria-controls={detailsOpen ? "task-details" : undefined} onClick={() => setDetailsOpen((open) => !open)}>查看详情<ChevronDown size={16} /></button>
+          {detailsOpen && <section id="task-details" className="details-popover" role="dialog" aria-modal="false" aria-labelledby="task-details-title">
+            <header><h2 id="task-details-title">{isEncoding ? "正在压缩" : completedCount ? "最近一次任务" : "任务详情"}</h2><button className="icon-only" aria-label="关闭任务详情" onClick={() => { setDetailsOpen(false); detailsButtonRef.current?.focus(); }}><X size={16} /></button></header>
+            <div className="details-counts" aria-live="polite"><span>完成 <strong>{completedCount}</strong></span><span>失败 <strong>{failedCount}</strong></span><span>总计 <strong>{queue.length}</strong></span></div>
+            {lastError && <p className="details-error">{lastError}</p>}
+            <h3>运行日志</h3>
+            <ul className="details-log" aria-label="运行日志">{log.map((line, index) => <li key={`${index}-${line}`}>{line}</li>)}</ul>
+          </section>}
+        </div>
+        {isEncoding && <button className="cancel-button" onClick={cancelCurrentEncoding}><Square size={15} />取消任务</button>}
         <button className="encode-button" disabled={isEncoding || !selectedItems.length || !toolStatus.ok} onClick={encodeSelected}><Play size={20} />{isEncoding ? "正在压缩" : completedCount ? "再次压缩" : "开始压缩"}</button>
       </footer>
 
@@ -1090,6 +1041,7 @@ export default function App() {
       )}
 
       {settingsOpen && <Modal title="应用设置" onClose={() => setSettingsOpen(false)} footer={<><button className="secondary-button" onClick={() => setPreferencesDraft(defaultPreferences)}>恢复默认</button><button className="primary-button" onClick={commitPreferences}>保存设置</button></>}>
+        <ThemeSettings colors={preferencesDraft.theme} onChange={(theme) => setPreferencesDraft((draft) => ({ ...draft, theme }))} />
         <div className="modal-grid two-columns">
           <Setting label="默认输出策略"><select value={preferencesDraft.defaultOutputMode} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultOutputMode: event.target.value as Preset["outputMode"] }))}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
           <Setting label="序列帧默认帧率"><input type="number" min={0.001} step={0.001} value={preferencesDraft.defaultSequenceFps} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultSequenceFps: Number(event.target.value) }))} /></Setting>
@@ -1101,6 +1053,12 @@ export default function App() {
           <label className="hardware-toggle-row settings-hardware-toggle"><span>启用硬件加速</span><input type="checkbox" checked={preferencesDraft.defaultHardware !== "cpu"} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: event.target.checked ? (platform.accelerators.includes("cuda") ? "cuda" : platform.accelerators.includes("metal") ? "metal" : "auto") : "cpu" }))} /><span className={`switch-visual ${preferencesDraft.defaultHardware !== "cpu" ? "on" : ""}`}><span /></span></label>
           <div className="hardware-device-list"><span className="field-note">可用设备</span>{platform.accelerators.filter((item) => item !== "auto").map((accelerator) => <button className={`hardware-row ${preferencesDraft.defaultHardware === accelerator ? "selected" : ""}`} key={accelerator} onClick={() => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: accelerator }))}><span className={`status-dot ${accelerator === "cpu" ? "blue" : ""}`} /><strong>{accelerator === "cuda" ? "CUDA" : accelerator === "metal" ? "Metal" : "CPU"}</strong><small>{accelerator === "cuda" ? "NVIDIA GPU" : accelerator === "metal" ? "Apple GPU" : "自动回退"}</small></button>)}</div>
           <div className="environment-card"><strong>编码环境</strong><span>{toolStatus.ok ? "FFmpeg 与 FFprobe 可用" : "编码工具不可用"}</span><small>{toolStatus.ffmpeg}</small><small>{toolStatus.ffprobe}</small><small>{toolStatus.encoders.length ? `可用编码器：${toolStatus.encoders.join("、")}` : "未检测到硬件编码器"}</small></div>
+        </div>
+        <div className="modal-section">
+          <h3>Insta360 全景处理</h3>
+          <Setting label="Desktop Media SDK 目录"><input value={preferencesDraft.insta360SdkPath} placeholder="留空时自动检测程序旁的 insta360/" onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, insta360SdkPath: event.target.value }))} /></Setting>
+          <button className="secondary-button full" onClick={async () => { const paths = await pickFolder(); if (paths[0]) setPreferencesDraft((draft) => ({ ...draft, insta360SdkPath: paths[0] })); }}><FolderOpen size={15} />选择 SDK 目录</button>
+          <small className="field-note">{toolStatus.insta360Sdk ? `已找到程序（编码前检查参数与模型）：${toolStatus.insta360Sdk}` : "未找到 MediaSDKTest。INSV 可以导入，拼接导出需先配置官方 SDK。"}</small>
         </div>
         <div className="preference-list">
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.keepTimesByDefault} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, keepTimesByDefault: event.target.checked }))} /><span>新任务默认保留创建日期与修改时间</span></label>
@@ -1115,7 +1073,7 @@ export default function App() {
         const item = queue.find((entry) => entry.id === mediaInfoItemId);
         if (!item) return null;
         const itemPreset = presetForItem(item, presets, activePreset);
-        return <MediaInfoModal item={item} outputPath={item.output || (itemPreset ? previewOutput(item, itemPreset) : "")} onClose={() => setMediaInfoItemId("")} onTogglePanorama={() => togglePanorama(item.id)} onRevealSource={() => revealItemPath(item.source)} onRevealOutput={(path) => revealItemPath(path)} />;
+        return <MediaInfoModal item={item} presetName={presetNameForItem(item, presets, activePreset, activePresetId)} outputPath={item.output || (itemPreset ? previewOutput(item, itemPreset) : "")} onClose={() => setMediaInfoItemId("")} onTogglePanorama={() => togglePanorama(item.id)} onRevealSource={() => revealItemPath(item.source)} onRevealOutput={(path) => revealItemPath(path)} />;
       })()}
 
       {helpOpen && <Modal title="使用帮助" onClose={() => setHelpOpen(false)} footer={<button className="primary-button" onClick={() => setHelpOpen(false)}>知道了</button>}>
@@ -1172,36 +1130,7 @@ function PresetEditor({ draft, platform, onChange, onChooseLut, onChooseOutput, 
   return <Modal title="编辑我的预设" onClose={onClose} footer={<><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={onSave}>保存预设</button></>}>
     <div className="preset-editor-intro"><Edit3 size={18} /><span><strong>独立预设编辑器</strong><small>此处修改预设库，不会直接改变右侧当前任务的输出设置。</small></span></div>
     <Setting label="预设名称"><input autoFocus value={draft.name} onChange={(event) => onChange({ name: event.target.value })} /></Setting>
-    <div className="modal-section"><h3>格式与画质</h3><div className="modal-grid three-columns">
-      <Setting label="格式"><select value={draft.codec} onChange={(event) => onChange(codecPatch(event.target.value as Codec))}>{Object.entries(codecLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
-      <Setting label="色深"><select value={draft.bitDepth} onChange={(event) => onChange({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">原视频参数</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Setting>
-      <Setting label="色度采样"><select value={draft.chroma} onChange={(event) => onChange({ chroma: event.target.value as Preset["chroma"] })}><option value="source">原视频参数</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Setting>
-      <Setting label="分辨率"><select value={resolutionValue(draft)} onChange={(event) => applyResolution(event.target.value, onChange)}><option value="source">保持原尺寸</option><option value="1080">短边 1080p</option><option value="720">短边 720p</option><option value="scale">缩放至倍率</option><option value="custom">自定义</option></select></Setting>
-      <Setting label="码率模式"><select value={draft.bitrateMode} onChange={(event) => onChange({ bitrateMode: event.target.value as Preset["bitrateMode"] })}><option value="source_multiplier">按源视频比例</option><option value="target_mbps">指定码率</option></select></Setting>
-      <Setting label={draft.bitrateMode === "target_mbps" ? "目标码率 Mbps" : "源码率比例 %"}><input type="number" step={draft.bitrateMode === "target_mbps" ? .01 : .1} value={draft.bitrateMode === "target_mbps" ? draft.targetBitrateMbps : Number((draft.bitrateMultiplier * 100).toFixed(2))} onChange={(event) => draft.bitrateMode === "target_mbps" ? onChange({ targetBitrateMbps: Number(event.target.value) }) : onChange({ bitrateMultiplier: Number(event.target.value) / 100 })} /></Setting>
-    </div>
-    <Setting label="帧率"><select value={draft.fpsMode} onChange={(event) => onChange({ fpsMode: event.target.value as FpsMode })}>{Object.entries(fpsLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Setting>
-    {draft.fpsMode === "preset" && <Setting label="目标帧率"><select value={draft.fpsValue} onChange={(event) => onChange({ fpsValue: Number(event.target.value) })}>{commonFpsOptions.map((fps) => <option key={fps} value={fps}>{fpsLabel(fps)}</option>)}</select></Setting>}
-    {draft.fpsMode === "custom" && <Setting label="目标帧率"><input type="number" min={0.001} step={0.001} value={draft.fpsValue} onChange={(event) => onChange({ fpsValue: Number(event.target.value) })} /></Setting>}
-    </div>
-    {draft.resolutionMode === "scale_percent" && <label className="range-setting"><span>缩放倍率 <strong>{draft.scalePercent}%</strong></span><input type="range" min={10} max={90} value={draft.scalePercent} onChange={(event) => onChange({ scalePercent: Number(event.target.value) })} /></label>}
-    {draft.resolutionMode === "custom" && <div className="dimension-grid modal-dimensions"><Setting label="宽"><input type="number" min={2} value={draft.customWidth} onChange={(event) => onChange({ customWidth: Number(event.target.value) })} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={draft.customHeight} onChange={(event) => onChange({ customHeight: Number(event.target.value) })} /></Setting></div>}
-    <div className="modal-section"><h3>色彩与编码</h3><div className="modal-grid three-columns">
-      <Setting label="硬件"><select value={draft.hardware} onChange={(event) => onChange({ hardware: event.target.value as Hardware })}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Setting>
-      <Setting label="色彩空间"><select value={draft.colorSpace} onChange={(event) => onChange({ colorSpace: event.target.value as Preset["colorSpace"] })}><option value="source">跟随源文件</option><option value="rec709">Rec.709</option><option value="rec2020">Rec.2020</option></select></Setting>
-      <Setting label="HDR"><select value={draft.hdrMode} onChange={(event) => onChange(hdrPatch(event.target.value as Preset["hdrMode"], draft))}><option value="source">跟随源文件</option><option value="sdr">SDR / Rec.709</option><option value="hlg">HLG</option><option value="hdr10">HDR10</option><option value="dolby_vision">杜比视界保留</option></select></Setting>
-    </div></div>
-    <div className="modal-section"><h3>输出与后处理</h3><div className="modal-grid two-columns">
-      <Setting label="输出策略"><select value={draft.outputMode} onChange={(event) => onChange({ outputMode: event.target.value as Preset["outputMode"] })}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
-      <Setting label="封装格式"><select value={draft.outputContainer} onChange={(event) => onChange({ outputContainer: event.target.value as Preset["outputContainer"] })}><option value="source">保持原后缀名</option><option value="mp4">MP4</option><option value="mov">MOV</option><option value="avi">AVI</option><option value="mkv">MKV</option><option value="webm">WebM</option><option value="m4v">M4V</option><option value="m4a">M4A</option><option value="wav">WAV（PCM 音频）</option></select></Setting>
-      <Setting label="命名"><select value={draft.namingMode} onChange={(event) => onChange({ namingMode: event.target.value as Preset["namingMode"] })}><option value="original">保持原名</option><option value="suffix_prefix">添加前后缀</option></select></Setting>
-      <Setting label="Alpha 背景"><select value={draft.alphaBackground} onChange={(event) => onChange({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Setting>
-    </div>
-    {draft.outputMode === "single_folder" && <button className="secondary-button full" onClick={onChooseOutput}><FolderOpen size={15} />{draft.outputDir ? shortPath(draft.outputDir) : "选择输出目录"}</button>}
-    {draft.namingMode === "suffix_prefix" && <div className="modal-grid two-columns"><Setting label="前缀"><input value={draft.prefix} onChange={(event) => onChange({ prefix: event.target.value })} /></Setting><Setting label="后缀"><input value={draft.suffix} onChange={(event) => onChange({ suffix: event.target.value })} /></Setting></div>}
-    <div className="preference-list compact"><label className="inline-check"><input type="checkbox" checked={draft.keepTimes} onChange={(event) => onChange({ keepTimes: event.target.checked })} /><span>保留创建与修改时间</span></label><label className="inline-check"><input type="checkbox" checked={draft.keepPanorama} onChange={(event) => onChange({ keepPanorama: event.target.checked })} /><span>保留全景元数据</span></label><label className="inline-check"><input type="checkbox" checked={draft.cpuFallback} onChange={(event) => onChange({ cpuFallback: event.target.checked })} /><span>失败时回退 CPU</span></label><label className="inline-check"><input type="checkbox" checked={draft.lutEnabled} onChange={(event) => onChange({ lutEnabled: event.target.checked })} /><span>启用 LUT</span></label></div>
-    {draft.lutEnabled && <button className="secondary-button full" onClick={onChooseLut}><FilePlus2 size={15} />{draft.lutName ? shortPath(draft.lutName) : "选择 LUT 文件"}</button>}
-    </div>
+    <OutputSettings preset={draft} platform={platform} onChange={onChange} onChooseLut={onChooseLut} onChooseOutput={onChooseOutput} />
   </Modal>;
 }
 
@@ -1209,15 +1138,16 @@ function SearchField({ value, onChange, placeholder, compact = false }: { value:
   return <label className={`search-field ${compact ? "compact" : ""}`}><Search size={15} /><input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} /></label>;
 }
 
-function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealSource, onRevealOutput }: {
+function MediaInfoModal({ item, presetName, outputPath, onClose, onTogglePanorama, onRevealSource, onRevealOutput }: {
   item: QueueItem;
+  presetName: string;
   outputPath: string;
   onClose: () => void;
   onTogglePanorama: () => void;
   onRevealSource: () => void;
   onRevealOutput: (path: string) => void;
 }) {
-  const mediaType = item.mediaKind === "sequence" ? "序列帧媒体" : item.mediaKind === "audio" ? "音频文件" : "视频文件";
+  const mediaType = /\.insv$/i.test(item.source) ? "INSV 全景原片（待拼接）" : item.mediaKind === "sequence" ? "序列帧媒体" : item.mediaKind === "audio" ? "音频文件" : "视频文件";
   const color = [item.colorSpace || "未知", item.colorTransfer || "未知"].join(" · ");
   const tracks = `${item.audioTracks} 条音轨 · ${item.subtitleTracks} 条字幕`;
   return <Modal title={`源信息 · ${item.fileName}`} onClose={onClose} footer={<button className="primary-button" onClick={onClose}>关闭</button>}>
@@ -1228,7 +1158,7 @@ function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealS
     <div className="media-info-grid">
       <InfoField label="文件名" value={item.fileName} />
       <InfoField label="媒体类型" value={mediaType} />
-      <InfoField label="分辨率" value={`${item.width} × ${item.height}`} />
+      <InfoField label={/\.insv$/i.test(item.source) ? "预期拼接尺寸" : "分辨率"} value={`${item.width} × ${item.height}`} />
       <InfoField label="帧率" value={item.fps} />
       <InfoField label="时长" value={formatDuration(item.duration)} />
       <InfoField label="文件体积" value={formatBytes(item.sizeBytes)} />
@@ -1243,12 +1173,12 @@ function MediaInfoModal({ item, outputPath, onClose, onTogglePanorama, onRevealS
       <InfoField label="全景状态" value={item.isPanorama ? "全景视频" : "非全景视频"} />
       <InfoField label="自动识别" value={item.panoramaTagged ? "已识别全景元数据" : "未检测到标准全景标记"} />
       <InfoField label="当前状态" value={`${item.status} · ${item.progress}%`} />
-      <InfoField label="预设" value={item.presetId || "未选择"} />
+      <InfoField label="预设" value={presetName || "未设置预设"} />
       <InfoField label="音频画面" value={item.mediaKind === "audio" ? audioVisualLabel(item.audioVisual) : "不适用"} />
       <InfoField label="外接音频" value={item.externalAudio || "未添加"} />
       <InfoField label="Alpha 遮罩" value={item.hasAlpha ? (item.exportAlphaMask ? "已启用独立导出" : "未启用") : "无 Alpha 通道"} />
     </div>
-    <div className="media-info-section"><h3>全景与输出</h3>{item.mediaKind !== "audio" && <div className="media-info-actions"><button className={`panorama-toggle info-panorama-toggle ${item.isPanorama ? "is-on" : ""}`} onClick={onTogglePanorama}>{item.isPanorama ? "全景视频" : "非全景视频"}</button><small>{item.panoramaTagged ? "状态来自自动识别，也可以手动切换" : "可手动切换全景标记"}</small></div>}<button className="path-link info-output-path" title={outputPath || "未设置输出路径"} disabled={!outputPath} onClick={() => outputPath && onRevealOutput(outputPath)}>{outputPath || "未设置输出路径"}</button>{item.alphaOutput && <button className="path-link info-output-path alpha-output-path" title={item.alphaOutput} onClick={() => onRevealOutput(item.alphaOutput)}>Alpha 输出：{item.alphaOutput}</button>}</div>
+    <div className="media-info-section"><h3>全景与输出</h3>{item.mediaKind !== "audio" && <div className="media-info-actions"><button className={`panorama-toggle info-panorama-toggle ${item.isPanorama ? "is-on" : ""}`} disabled={/\.insv$/i.test(item.source)} onClick={onTogglePanorama}>{item.isPanorama ? "全景视频" : "非全景视频"}</button><small>{item.panoramaTagged ? "状态来自自动识别，也可以手动切换" : "可手动切换全景标记"}</small></div>}<button className="path-link info-output-path" title={outputPath || "未设置输出路径"} disabled={!outputPath} onClick={() => outputPath && onRevealOutput(outputPath)}>{outputPath || "未设置输出路径"}</button>{item.alphaOutput && <button className="path-link info-output-path alpha-output-path" title={item.alphaOutput} onClick={() => onRevealOutput(item.alphaOutput)}>Alpha 输出：{item.alphaOutput}</button>}</div>
     {item.mediaKind === "sequence" && <div className="media-info-section"><h3>序列信息</h3><div className="media-info-grid compact"><InfoField label="序列模式" value={item.sequencePattern || "未知"} /><InfoField label="起始帧号" value={String(item.sequenceStartNumber)} /><InfoField label="帧数" value={String(item.sequenceFrameCount)} /><InfoField label="序列帧率" value={`${item.sequenceFps} fps`} /><InfoField label="像素宽幅" value={`${item.sequencePixelAspect}x`} /></div></div>}
   </Modal>;
 }
@@ -1296,26 +1226,23 @@ function presetForItem(item: QueueItem, presets: Preset[], fallback?: Preset) {
   return presets.find((preset) => preset.id === item.presetId) ?? fallback;
 }
 
-function codecPatch(codec: Codec): Partial<Preset> {
-  if (codec === "prores") return { codec, bitDepth: 10, chroma: "422", hardware: "cpu", outputContainer: "mov" };
-  return { codec };
-}
-
-function hdrPatch(hdrMode: Preset["hdrMode"], preset?: Preset): Partial<Preset> {
-  if (hdrMode === "hlg" || hdrMode === "hdr10") {
-    return { hdrMode, colorSpace: "rec2020", bitDepth: 10, hardware: "cpu", codec: preset?.codec === "h264" ? "h265" : preset?.codec };
+function presetNameForItem(item: QueueItem, presets: Preset[], fallback?: Preset, activePresetId = "") {
+  const preset = presetForItem(item, presets, fallback);
+  if (!preset) return "";
+  if (preset === fallback && preset.id !== activePresetId) {
+    const saved = presets.find((entry) => entry.id === preset.id);
+    return saved ? `${saved.name}（已调整）` : "自定义设置";
   }
-  if (hdrMode === "dolby_vision") {
-    return { hdrMode, codec: "h265", bitDepth: 10, chroma: "420", resolutionMode: "source", lutEnabled: false, fpsMode: "source" };
-  }
-  return { hdrMode, colorSpace: hdrMode === "sdr" ? "rec709" : "source" };
+  return preset.name;
 }
 
 function estimateOutputBytes(item: QueueItem, preset?: Preset) {
   if (!preset || !item.duration) return 0;
   const outputContainer = preset.outputContainer === "source" && item.mediaKind === "audio" ? "mp4" : preset.outputContainer;
   if (outputContainer === "wav") {
-    return Math.max(44_100, Math.round(item.duration * 48_000 * 3));
+    const bytesPerSample = preset.wavEncoding === "float32" ? 4 : preset.wavEncoding === "pcm24" ? 3 : 2;
+    // Approximate using 48 kHz stereo; actual sample rate/channels follow the source.
+    return Math.max(44_100, Math.round(item.duration * 48_000 * 2 * bytesPerSample));
   }
   if (item.mediaKind === "audio" && outputContainer === "m4a") {
     return Math.max(32_000, Math.round(item.duration * 320_000 / 8));
@@ -1346,20 +1273,6 @@ function targetResolution(item: QueueItem, preset?: Preset) {
   return `短边 ${preset.shortEdge}p`;
 }
 
-function resolutionValue(preset?: Preset) {
-  if (!preset || preset.resolutionMode === "source") return "source";
-  if (preset.resolutionMode === "short_edge") return String(preset.shortEdge);
-  if (preset.resolutionMode === "custom") return "custom";
-  return "scale";
-}
-
-function applyResolution(value: string, update: (patch: Partial<Preset>) => void) {
-  if (value === "source") update({ resolutionMode: "source" });
-  else if (value === "scale") update({ resolutionMode: "scale_percent" });
-  else if (value === "custom") update({ resolutionMode: "custom" });
-  else update({ resolutionMode: "short_edge", shortEdge: Number(value) });
-}
-
 function outputDirectory(preset?: Preset) {
   if (!preset) return "未设置";
   if (preset.outputMode === "single_folder") return preset.outputDir || "选择输出目录";
@@ -1377,12 +1290,6 @@ function hdrLabel(mode: QueueItem["hdrMode"]) {
   if (mode === "hdr10") return "HDR10";
   if (mode === "hlg") return "HLG";
   return "SDR";
-}
-
-function alphaBackgroundLabel(background?: AlphaBackground) {
-  if (background === "black") return "黑底";
-  if (background === "white") return "白底";
-  return "棋盘格";
 }
 
 function audioVisualLabel(visual: QueueItem["audioVisual"]) {
@@ -1416,7 +1323,7 @@ function previewOutput(item: QueueItem, preset: Preset) {
   const name = preset.namingMode === "original" ? stem : `${preset.prefix}${stem}${preset.suffix}`;
   const sourceExtension = hasExtension ? fileName.slice(dot).toLowerCase() : "";
   const extension = preset.outputContainer === "source"
-    ? item.mediaKind === "sequence" || item.mediaKind === "audio" ? ".mp4" : sourceExtension || (preset.codec === "prores" ? ".mov" : ".mp4")
+    ? sourceExtension === ".insv" ? (preset.codec === "prores" ? ".mov" : ".mp4") : item.mediaKind === "sequence" || item.mediaKind === "audio" ? ".mp4" : sourceExtension || (preset.codec === "prores" ? ".mov" : ".mp4")
     : `.${preset.outputContainer}`;
   const outputDirectory = preset.outputMode === "single_folder" && preset.outputDir
     ? preset.outputDir

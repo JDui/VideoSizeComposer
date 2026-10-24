@@ -20,9 +20,12 @@ use tauri::{Emitter, Manager};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod insta360;
+use insta360::{is_insv, PanoramaPreferences};
+
 const VIDEO_EXTENSIONS: &[&str] = &[
     "3g2", "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "mxf",
-    "ogv", "ts", "webm", "wmv",
+    "ogv", "ts", "webm", "wmv", "insv",
 ];
 const SEQUENCE_EXTENSIONS: &[&str] = &[
     "bmp", "dpx", "exr", "jpeg", "jpg", "png", "tga", "tif", "tiff", "webp",
@@ -42,6 +45,7 @@ struct PlatformInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct AppPreferences {
+    theme: serde_json::Value,
     default_hardware: String,
     default_output_mode: String,
     default_output_dir: String,
@@ -49,11 +53,16 @@ struct AppPreferences {
     confirm_before_clear: bool,
     auto_open_details: bool,
     default_sequence_fps: f64,
+    insta360_sdk_path: String,
 }
 
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
+            theme: serde_json::json!({
+                "background": "#111116", "surface": "#202027", "text": "#f0eff4",
+                "muted": "#aaa7b5", "accent": "#c2ace9", "action": "#b69cde"
+            }),
             default_hardware: "auto".into(),
             default_output_mode: "subfolder".into(),
             default_output_dir: String::new(),
@@ -61,6 +70,7 @@ impl Default for AppPreferences {
             confirm_before_clear: true,
             auto_open_details: true,
             default_sequence_fps: 30.0,
+            insta360_sdk_path: String::new(),
         }
     }
 }
@@ -72,6 +82,7 @@ struct ToolStatus {
     ffprobe: String,
     encoders: Vec<String>,
     ok: bool,
+    insta360_sdk: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,11 +112,15 @@ struct Preset {
     output_dir: String,
     #[serde(default = "default_output_container")]
     output_container: String,
+    #[serde(default = "default_wav_encoding")]
+    wav_encoding: String,
     naming_mode: String,
     prefix: String,
     suffix: String,
     keep_times: bool,
     keep_panorama: bool,
+    #[serde(default)]
+    panorama: PanoramaPreferences,
     #[serde(default = "default_alpha_background")]
     alpha_background: String,
     #[serde(default = "default_color_space")]
@@ -219,6 +234,7 @@ enum EncodePhase {
     Main {
         reserve_alpha: bool,
     },
+    InsvEncode,
     Alpha {
         main_output: String,
         alpha_output: String,
@@ -236,6 +252,7 @@ fn phase_progress(raw: u8, phase: &EncodePhase) -> u8 {
         EncodePhase::Main {
             reserve_alpha: false,
         } => raw as u8,
+        EncodePhase::InsvEncode => (35 + raw * 64 / 100) as u8,
         EncodePhase::Alpha { .. } => (90 + ((raw * 9 + 99) / 100)) as u8,
     }
 }
@@ -243,14 +260,16 @@ fn phase_progress(raw: u8, phase: &EncodePhase) -> u8 {
 fn phase_status(raw: u8, phase: &EncodePhase) -> String {
     let progress = phase_progress(raw, phase);
     match phase {
-        EncodePhase::Main { .. } => format!("编码中 {progress}%"),
+        EncodePhase::Main { .. } | EncodePhase::InsvEncode => format!("编码中 {progress}%"),
         EncodePhase::Alpha { .. } => format!("生成 Alpha 遮罩 {progress}%"),
     }
 }
 
 fn phase_output_paths(output: &Path, phase: &EncodePhase) -> (String, Option<String>) {
     match phase {
-        EncodePhase::Main { .. } => (output.to_string_lossy().to_string(), None),
+        EncodePhase::Main { .. } | EncodePhase::InsvEncode => {
+            (output.to_string_lossy().to_string(), None)
+        }
         EncodePhase::Alpha {
             main_output,
             alpha_output,
@@ -325,6 +344,7 @@ fn get_tool_status() -> ToolStatus {
         ffprobe,
         encoders,
         ok: ffmpeg_ok && ffprobe_ok,
+        insta360_sdk: insta360::resolve_sdk().map(|path| path.to_string_lossy().to_string()),
     }
 }
 
@@ -857,7 +877,12 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
             Ok(job)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    preflight_jobs(&jobs)?;
+    let jobs = tauri::async_runtime::spawn_blocking(move || {
+        preflight_jobs(&jobs)?;
+        Ok::<_, String>(jobs)
+    })
+    .await
+    .map_err(|error| format!("编码预检查异常：{error}"))??;
     let session_id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     encode_sessions()
@@ -922,7 +947,8 @@ fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
             .open(&probe)
             .map_err(|error| format!("输出目录不可写 {}：{error}", directory.display()))?;
         let _ = fs::remove_file(&probe);
-        let required = estimated_output_bytes(&job.item, &job.preset);
+        let required = estimated_output_bytes(&job.item, &job.preset)
+            .saturating_add(insta360::intermediate_bytes(&job.item, &job.preset));
         required_by_directory
             .entry(directory)
             .and_modify(|total| *total = total.saturating_add(required))
@@ -968,6 +994,7 @@ fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
 }
 
 fn validate_preset(preset: &Preset) -> Result<(), String> {
+    preset.panorama.validate()?;
     if !matches!(preset.codec.as_str(), "h264" | "h265" | "av1" | "prores") {
         return Err(format!("不支持的编码格式：{}", preset.codec));
     }
@@ -1030,6 +1057,9 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
 
 fn validate_job(job: &EncodeJob) -> Result<(), String> {
     validate_preset(&job.preset)?;
+    if is_insv(Path::new(&job.item.source)) {
+        insta360::validate_insv_job(&job.item, &job.preset)?;
+    }
     let container = output_extension(&job.item, &job.preset);
     let has_external_audio = !job.item.external_audio.trim().is_empty();
     if has_external_audio {
@@ -1330,10 +1360,12 @@ fn preset_with_defaults(id: &str, name: &str, codec: &str, suffix: &str) -> Pres
             default_output_container()
         },
         naming_mode: "suffix_prefix".into(),
+        wav_encoding: default_wav_encoding(),
         prefix: String::new(),
         suffix: suffix.into(),
         keep_times: true,
         keep_panorama: true,
+        panorama: PanoramaPreferences::default(),
         alpha_background: default_alpha_background(),
         color_space: default_color_space(),
         hdr_mode: default_hdr_mode(),
@@ -1364,6 +1396,18 @@ fn default_custom_height() -> u32 {
 
 fn default_output_container() -> String {
     "source".into()
+}
+
+fn default_wav_encoding() -> String {
+    "pcm16".into()
+}
+
+fn wav_audio_codec(preset: &Preset) -> &'static str {
+    match preset.wav_encoding.as_str() {
+        "pcm24" => "pcm_s24le",
+        "float32" => "pcm_f32le",
+        _ => "pcm_s16le",
+    }
 }
 
 fn default_fps_mode() -> String {
@@ -1830,7 +1874,13 @@ fn path_components_equal(left: &Component<'_>, right: &Component<'_>) -> bool {
 }
 
 fn collect_media_files(paths: Vec<String>) -> Vec<PathBuf> {
-    collect_files(paths, is_media)
+    let mut files: Vec<_> = collect_files(paths, is_media)
+        .into_iter()
+        .map(|path| insta360::primary_path(&path))
+        .collect();
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn collect_files<F>(paths: Vec<String>, accepts: F) -> Vec<PathBuf>
@@ -1970,7 +2020,7 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
     let color_transfer = video["color_transfer"].as_str().unwrap_or("").to_string();
     let hdr_mode = detect_hdr_mode(&video);
 
-    Ok(QueueItem {
+    let mut item = QueueItem {
         id: Uuid::new_v4().to_string(),
         source: path.to_string_lossy().to_string(),
         file_name,
@@ -2062,7 +2112,11 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         alpha_output: String::new(),
         external_audio: String::new(),
         audio_visual: default_audio_visual(),
-    })
+    };
+    if is_insv(path) {
+        insta360::describe_insv(&mut item, &json)?;
+    }
+    Ok(item)
 }
 
 fn has_audio_stream(path: &Path) -> bool {
@@ -2137,6 +2191,29 @@ fn encode_job(
         fs::create_dir_all(parent).map_err(|error| (item_id.clone(), error.to_string()))?;
     }
 
+    let stitched = if is_insv(&source)
+        && !matches!(
+            output_extension(&job.item, &job.preset).as_str(),
+            "m4a" | "wav"
+        ) {
+        match insta360::prepare_insv(app, &job.item, &job.preset, &output, cancel) {
+            Ok(prepared) => Some(prepared),
+            Err(error) if error == CANCELLED_ERROR => {
+                emit_cancelled(app, item_id);
+                return Ok(());
+            }
+            Err(error) => return Err((item_id, error)),
+        }
+    } else {
+        None
+    };
+    let encoding_item = stitched
+        .as_ref()
+        .map(|prepared| &prepared.item)
+        .unwrap_or(&job.item);
+    let mut encoding_preset = job.preset.clone();
+    encoding_preset.output_container = output_extension(&job.item, &job.preset);
+
     let sequence_list = if job.item.media_kind == "sequence" {
         Some(
             write_sequence_concat_file(&job.item, &temporary_output)
@@ -2147,20 +2224,24 @@ fn encode_job(
     };
     let _sequence_list_guard = sequence_list.clone().map(TemporaryFileGuard);
     let args = build_ffmpeg_args_with_sequence(
-        &job.item,
-        &job.preset,
+        encoding_item,
+        &encoding_preset,
         &temporary_output,
         sequence_list.as_deref(),
     );
-    let main_phase = EncodePhase::Main {
-        reserve_alpha: job.item.export_alpha_mask,
+    let main_phase = if stitched.is_some() {
+        EncodePhase::InsvEncode
+    } else {
+        EncodePhase::Main {
+            reserve_alpha: job.item.export_alpha_mask,
+        }
     };
     let _ = app.emit(
         "encode-progress",
         EncodeProgress {
             item_id: item_id.clone(),
-            progress: 0,
-            status: "编码中".into(),
+            progress: phase_progress(0, &main_phase),
+            status: phase_status(0, &main_phase),
             output: Some(output.to_string_lossy().to_string()),
             ok: None,
             message: Some(format!("ffmpeg {}", shell_join(&args))),
@@ -2171,7 +2252,7 @@ fn encode_job(
     if let Err(first_error) = run_ffmpeg(
         app,
         &item_id,
-        &job.item,
+        encoding_item,
         &args,
         &output,
         cancel,
@@ -2186,10 +2267,10 @@ fn encode_job(
             && job.preset.hardware != "cpu"
             && job.preset.hdr_mode != "dolby_vision"
         {
-            let mut cpu_preset = job.preset.clone();
+            let mut cpu_preset = encoding_preset.clone();
             cpu_preset.hardware = "cpu".into();
             let cpu_args = build_ffmpeg_args_with_sequence(
-                &job.item,
+                encoding_item,
                 &cpu_preset,
                 &temporary_output,
                 sequence_list.as_deref(),
@@ -2198,7 +2279,7 @@ fn encode_job(
                 "encode-progress",
                 EncodeProgress {
                     item_id: item_id.clone(),
-                    progress: 0,
+                    progress: phase_progress(0, &main_phase),
                     status: "硬件编码失败，回退 CPU".into(),
                     output: Some(output.to_string_lossy().to_string()),
                     ok: None,
@@ -2209,7 +2290,7 @@ fn encode_job(
             if let Err(error) = run_ffmpeg(
                 app,
                 &item_id,
-                &job.item,
+                encoding_item,
                 &cpu_args,
                 &output,
                 cancel,
@@ -2237,7 +2318,7 @@ fn encode_job(
         return Ok(());
     }
 
-    if job.preset.keep_panorama && job.item.is_panorama && is_isobmff_path(&temporary_output) {
+    if job.preset.keep_panorama && encoding_item.is_panorama && is_isobmff_path(&temporary_output) {
         if let Err(error) = inject_spherical_metadata(&temporary_output) {
             let _ = fs::remove_file(&temporary_output);
             return Err((item_id, format!("无法写入标准全景元数据: {error}")));
@@ -2263,8 +2344,8 @@ fn encode_job(
         let alpha_output = build_alpha_output_path(&output);
         let alpha_temporary = temporary_output_path(&alpha_output);
         let alpha_args = build_alpha_ffmpeg_args_with_sequence(
-            &job.item,
-            &job.preset,
+            encoding_item,
+            &encoding_preset,
             &alpha_temporary,
             sequence_list.as_deref(),
         );
@@ -2287,7 +2368,7 @@ fn encode_job(
         let alpha_result = run_ffmpeg(
             app,
             &item_id,
-            &job.item,
+            encoding_item,
             &alpha_args,
             &alpha_temporary,
             cancel,
@@ -2482,6 +2563,14 @@ fn build_output_path(item: &QueueItem, preset: &Preset) -> PathBuf {
 fn output_extension(item: &QueueItem, preset: &Preset) -> String {
     if preset.output_container != "source" {
         return preset.output_container.clone();
+    }
+    if is_insv(Path::new(&item.source)) {
+        return if preset.codec == "prores" {
+            "mov"
+        } else {
+            "mp4"
+        }
+        .into();
     }
     if matches!(item.media_kind.as_str(), "sequence" | "audio") {
         return "mp4".into();
@@ -2694,7 +2783,7 @@ fn build_ffmpeg_args_with_sequence(
             "-vn".into(),
             "-c:a".into(),
             if output_extension(item, preset) == "wav" {
-                "pcm_s24le".into()
+                wav_audio_codec(preset).into()
             } else {
                 "aac".into()
             },
@@ -2834,7 +2923,7 @@ fn build_ffmpeg_args_with_audio(
             "-vn".into(),
             "-c:a".into(),
             if extension == "wav" {
-                "pcm_s24le".into()
+                wav_audio_codec(preset).into()
             } else {
                 "aac".into()
             },
@@ -5681,18 +5770,34 @@ mod tests {
         wav_preset.output_container = "wav".into();
         wav_preset.output_dir = root.join("wav").to_string_lossy().to_string();
         fs::create_dir_all(&wav_preset.output_dir).unwrap();
-        let wav_output = build_output_path(&item, &wav_preset);
-        let wav_status = command_with_hidden_window(resolve_tool("ffmpeg"))
-            .args(build_ffmpeg_args(&item, &wav_preset, &wav_output))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(wav_status.success(), "audio WAV encode failed");
-        let wav_streams = probe_stream_types(&wav_output);
-        assert_eq!(wav_streams.len(), 1);
-        assert_eq!(wav_streams[0]["codec_type"], "audio");
-        assert_eq!(wav_streams[0]["codec_name"], "pcm_s24le");
+        let mut legacy = serde_json::to_value(&wav_preset).unwrap();
+        legacy.as_object_mut().unwrap().remove("wavEncoding");
+        let restored: Preset = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.wav_encoding, "pcm16");
+        for (encoding, codec) in [
+            ("pcm16", "pcm_s16le"),
+            ("pcm24", "pcm_s24le"),
+            ("float32", "pcm_f32le"),
+        ] {
+            wav_preset.wav_encoding = encoding.into();
+            // Exercise both the audio-only and regular media export paths.
+            for media_kind in ["audio", "video"] {
+                let mut wav_item = item.clone();
+                wav_item.media_kind = media_kind.into();
+                let wav_output = build_output_path(&wav_item, &wav_preset);
+                let wav_status = command_with_hidden_window(resolve_tool("ffmpeg"))
+                    .args(build_ffmpeg_args(&wav_item, &wav_preset, &wav_output))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(wav_status.success(), "{media_kind} WAV {encoding} encode failed");
+                let wav_streams = probe_stream_types(&wav_output);
+                assert_eq!(wav_streams.len(), 1);
+                assert_eq!(wav_streams[0]["codec_type"], "audio");
+                assert_eq!(wav_streams[0]["codec_name"], codec);
+            }
+        }
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,18 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VideoSize Composer",
-  "version": "2026.4.35",
+  "version": "2026.7.11",
   "identifier": "com.videosize.composer",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "pnpm build",
-    "frontendDist": "../dist"
+    "frontendDist": "../dist/web"
   },
   "app": {
     "windows": [
       {
-        "title": "VideoSize Composer 2026v4",
+        "title": "VideoSize Composer 2026v7-11",
         "width": 1440,
         "height": 1024,
         "minWidth": 1180,
