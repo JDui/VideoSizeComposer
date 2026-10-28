@@ -31,3 +31,11 @@ Folder: `dist/VideoSizeComposer`
 - `ffmpeg.exe`
 - `ffprobe.exe`
 - `README-PORTABLE.txt`
+
+## Addendum — HLG read/write pass (2026-10-29)
+
+- Rust suite: 48 passed, 0 failed (`cargo test --lib`), including 12 new HLG/colour cases with two real encode-and-measure regressions.
+- TypeScript + Vite production build: passed (`pnpm build`).
+- HLG chain harness: `qa/hlg/verify-hlg.ps1` — all checks pass; measurements and thresholds recorded in `qa/hlg/verification.md`.
+- Verified on real encodes with the bundled FFmpeg: HLG tag round-trip (`color_transfer=arib-std-b67`), HLG→SDR display-referred preservation (+5.5% luma vs the SDR master), full-scale HLG highlight compression (YMAX 231 within legal range), MDCV/MaxCLL read from frame side data and reused on HDR10 output, unlabelled wide-gamut clips flagged as suspect without pixel reinterpretation.
+- Not re-checked visually in this pass: the new `色调映射` select and the inspector's `源色彩解释` control.

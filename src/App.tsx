@@ -58,7 +58,7 @@ import {
   savePreferences,
   startEncode
 } from "./tauri";
-import type { AppPreferences, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
+import type { AppPreferences, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, SourceColorChoice, ToolStatus } from "./types";
 import { codecLabels, OutputSettings, presetSummary } from "./OutputSettings";
 
 const defaultPlatform: PlatformInfo = { os: "unknown", accelerators: ["auto", "cpu"] };
@@ -549,6 +549,13 @@ export default function App() {
       : item));
   }
 
+  /** 未标注 / 错标的 HLG、PQ 素材由用户确认后手动指定解释方式，随任务一起交给后端。 */
+  function setSourceColorOverride(itemId: string, choice: SourceColorChoice) {
+    setQueue((items) => items.map((item) => item.id === itemId
+      ? { ...item, sourceColorOverride: choice }
+      : item));
+  }
+
   async function revealItemPath(path: string) {
     if (!path) return;
     try {
@@ -944,7 +951,7 @@ export default function App() {
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
                     <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : item.mediaKind === "audio" ? <Zap size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : item.mediaKind === "audio" ? `音频 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small>{presetName && <span className="media-preset" title={`使用预设：${presetName}`}>预设：{presetName}</span>}<button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}{item.mediaKind === "audio" && <label className="row-inline-control" title="音频素材输出视频时使用的画面模式" onClick={(event) => event.stopPropagation()}><span>画面</span><select value={item.audioVisual} onChange={(event) => updateAudioVisual(item.id, event.target.value as QueueItem["audioVisual"])}><option value="timecode">时间码</option><option value="black">纯黑</option><option value="white">纯白</option></select></label>}{item.mediaKind !== "audio" && item.audioTracks === 0 && <button className="audio-attach-control" title={item.externalAudio || "添加外接音频"} onClick={(event) => { event.stopPropagation(); chooseExternalAudio(item.id); }}>{item.externalAudio ? `已添加音频 · ${shortPath(item.externalAudio)}` : "无音轨 · 添加音频"}</button>}{item.externalAudio && item.mediaKind !== "audio" && <button className="audio-clear-control" aria-label="清除外接音频" title="清除外接音频" onClick={(event) => { event.stopPropagation(); clearExternalAudio(item.id); }}><X size={11} /></button>}</span></div>
-                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.mediaKind === "audio" ? "纯音频" : `${item.bitDepth || 8}-bit · 4:2:${item.chroma.slice(-1)}`} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.exportAlphaMask && <em>Alpha 遮罩已启用</em>}{item.mediaKind === "audio" && <em>音频素材</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}{item.mediaKind !== "audio" && <button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} disabled={/\.insv$/i.test(item.source)} title={/\.insv$/i.test(item.source) ? "INSV 原片必须先进行全景拼接" : "点击切换全景状态"} onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button>}</span>{item.hasAlpha && item.mediaKind !== "audio" && <label className="alpha-mask-control" title="从源 Alpha 通道生成独立黑白视频" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={item.exportAlphaMask} onChange={(event) => toggleAlphaMask(item.id, event.target.checked)} /><span>单独导出 Alpha 遮罩</span></label>}</div>
+                    <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.mediaKind === "audio" ? "纯音频" : `${item.bitDepth || 8}-bit · 4:2:${item.chroma.slice(-1)}`} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.exportAlphaMask && <em>Alpha 遮罩已启用</em>}{item.mediaKind === "audio" && <em>音频素材</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{isSuspectHdr(item) && <em className="suspect" title="源没有写色彩元数据，但宽色域 + 10-bit 提示它可能是 HLG / HDR。打开源信息确认后再按 HDR 编码。">HDR（未标注）</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}{item.mediaKind !== "audio" && <button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} disabled={/\.insv$/i.test(item.source)} title={/\.insv$/i.test(item.source) ? "INSV 原片必须先进行全景拼接" : "点击切换全景状态"} onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button>}</span>{item.hasAlpha && item.mediaKind !== "audio" && <label className="alpha-mask-control" title="从源 Alpha 通道生成独立黑白视频" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={item.exportAlphaMask} onChange={(event) => toggleAlphaMask(item.id, event.target.checked)} /><span>单独导出 Alpha 遮罩</span></label>}</div>
                     <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
                     <StatusCell item={item} outputPath={outputPath} onRevealPath={revealItemPath} />
                     <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); openMediaInfo(item); }}><ChevronRight size={19} /></button>
@@ -1073,7 +1080,7 @@ export default function App() {
         const item = queue.find((entry) => entry.id === mediaInfoItemId);
         if (!item) return null;
         const itemPreset = presetForItem(item, presets, activePreset);
-        return <MediaInfoModal item={item} presetName={presetNameForItem(item, presets, activePreset, activePresetId)} outputPath={item.output || (itemPreset ? previewOutput(item, itemPreset) : "")} onClose={() => setMediaInfoItemId("")} onTogglePanorama={() => togglePanorama(item.id)} onRevealSource={() => revealItemPath(item.source)} onRevealOutput={(path) => revealItemPath(path)} />;
+        return <MediaInfoModal item={item} presetName={presetNameForItem(item, presets, activePreset, activePresetId)} outputPath={item.output || (itemPreset ? previewOutput(item, itemPreset) : "")} onClose={() => setMediaInfoItemId("")} onTogglePanorama={() => togglePanorama(item.id)} onSourceColorChange={(choice) => setSourceColorOverride(item.id, choice)} onRevealSource={() => revealItemPath(item.source)} onRevealOutput={(path) => revealItemPath(path)} />;
       })()}
 
       {helpOpen && <Modal title="使用帮助" onClose={() => setHelpOpen(false)} footer={<button className="primary-button" onClick={() => setHelpOpen(false)}>知道了</button>}>
@@ -1138,12 +1145,13 @@ function SearchField({ value, onChange, placeholder, compact = false }: { value:
   return <label className={`search-field ${compact ? "compact" : ""}`}><Search size={15} /><input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} /></label>;
 }
 
-function MediaInfoModal({ item, presetName, outputPath, onClose, onTogglePanorama, onRevealSource, onRevealOutput }: {
+function MediaInfoModal({ item, presetName, outputPath, onClose, onTogglePanorama, onSourceColorChange, onRevealSource, onRevealOutput }: {
   item: QueueItem;
   presetName: string;
   outputPath: string;
   onClose: () => void;
   onTogglePanorama: () => void;
+  onSourceColorChange: (choice: SourceColorChoice) => void;
   onRevealSource: () => void;
   onRevealOutput: (path: string) => void;
 }) {
@@ -1168,6 +1176,11 @@ function MediaInfoModal({ item, presetName, outputPath, onClose, onTogglePanoram
       <InfoField label="色度采样" value={item.mediaKind === "audio" ? "不适用" : `4:2:${item.chroma.slice(-1)}`} />
       <InfoField label="色彩空间 / 传递" value={color} />
       <InfoField label="HDR" value={hdrLabel(item.hdrMode)} />
+      <InfoField label="HDR 探测" value={hdrSignalLabel(item.hdrSignal)} />
+      <InfoField label="量化范围" value={item.mediaKind === "audio" ? "不适用" : item.colorRange === "pc" ? "pc（全范围）" : item.colorRange === "tv" ? "tv（有限范围）" : "未标注，按 tv 处理"} />
+      <InfoField label="母版峰值" value={item.peakLuminance && item.peakLuminance > 0 ? `${Math.round(item.peakLuminance)} cd/m²` : "未携带 MDCV"} />
+      <InfoField label="MaxCLL / MaxFALL" value={item.maxCll && item.maxCll > 0 ? `${item.maxCll} / ${item.maxFall ?? 0} cd/m²` : "未携带"} />
+      <InfoField label="编码域峰值" value={item.mediaKind === "audio" ? "不适用" : item.codedPeakRatio && item.codedPeakRatio > 0 ? `${Math.round(item.codedPeakRatio * 100)}% 满量程` : "未抽样"} />
       <InfoField label="Alpha 通道" value={item.hasAlpha ? "有" : "无"} />
       <InfoField label="音轨 / 字幕" value={tracks} />
       <InfoField label="全景状态" value={item.isPanorama ? "全景视频" : "非全景视频"} />
@@ -1178,6 +1191,18 @@ function MediaInfoModal({ item, presetName, outputPath, onClose, onTogglePanoram
       <InfoField label="外接音频" value={item.externalAudio || "未添加"} />
       <InfoField label="Alpha 遮罩" value={item.hasAlpha ? (item.exportAlphaMask ? "已启用独立导出" : "未启用") : "无 Alpha 通道"} />
     </div>
+    {item.mediaKind === "video" && <div className="media-info-section"><h3>源色彩解释</h3>
+      <div className="info-color-choice">
+        <span>按什么色彩解释源像素</span>
+        <select value={item.sourceColorOverride || "auto"} onChange={(event) => onSourceColorChange(event.target.value as SourceColorChoice)}>
+          <option value="auto">自动（{hdrSignalLabel(item.hdrSignal)}）</option>
+          <option value="sdr">按 {SOURCE_COLOR_LABELS.sdr}</option>
+          <option value="hlg">按 {SOURCE_COLOR_LABELS.hlg}</option>
+          <option value="hdr10">按 {SOURCE_COLOR_LABELS.hdr10}</option>
+        </select>
+        <small>{sourceColorHint(item)}</small>
+      </div>
+    </div>}
     <div className="media-info-section"><h3>全景与输出</h3>{item.mediaKind !== "audio" && <div className="media-info-actions"><button className={`panorama-toggle info-panorama-toggle ${item.isPanorama ? "is-on" : ""}`} disabled={/\.insv$/i.test(item.source)} onClick={onTogglePanorama}>{item.isPanorama ? "全景视频" : "非全景视频"}</button><small>{item.panoramaTagged ? "状态来自自动识别，也可以手动切换" : "可手动切换全景标记"}</small></div>}<button className="path-link info-output-path" title={outputPath || "未设置输出路径"} disabled={!outputPath} onClick={() => outputPath && onRevealOutput(outputPath)}>{outputPath || "未设置输出路径"}</button>{item.alphaOutput && <button className="path-link info-output-path alpha-output-path" title={item.alphaOutput} onClick={() => onRevealOutput(item.alphaOutput)}>Alpha 输出：{item.alphaOutput}</button>}</div>
     {item.mediaKind === "sequence" && <div className="media-info-section"><h3>序列信息</h3><div className="media-info-grid compact"><InfoField label="序列模式" value={item.sequencePattern || "未知"} /><InfoField label="起始帧号" value={String(item.sequenceStartNumber)} /><InfoField label="帧数" value={String(item.sequenceFrameCount)} /><InfoField label="序列帧率" value={`${item.sequenceFps} fps`} /><InfoField label="像素宽幅" value={`${item.sequencePixelAspect}x`} /></div></div>}
   </Modal>;
@@ -1290,6 +1315,42 @@ function hdrLabel(mode: QueueItem["hdrMode"]) {
   if (mode === "hdr10") return "HDR10";
   if (mode === "hlg") return "HLG";
   return "SDR";
+}
+
+function hdrSignalLabel(signal?: QueueItem["hdrSignal"]) {
+  switch (signal) {
+    case "hlg": return "HLG / BT.2100";
+    case "hdr10": return "HDR10 / PQ";
+    case "dolby_vision": return "Dolby Vision";
+    case "hlg_suspect": return "疑似 HLG（未标注）";
+    case "hdr10_suspect": return "疑似 HDR10（未标注）";
+    case "sdr": return "SDR";
+    default: return "未探测";
+  }
+}
+
+function isSuspectHdr(item: QueueItem) {
+  return item.hdrSignal === "hlg_suspect" || item.hdrSignal === "hdr10_suspect";
+}
+
+const SOURCE_COLOR_LABELS: Record<SourceColorChoice, string> = {
+  auto: "自动",
+  sdr: "SDR / Rec.709",
+  hlg: "HLG / BT.2100",
+  hdr10: "HDR10 / PQ"
+};
+
+function sourceColorHint(item: QueueItem) {
+  if (item.sourceColorOverride && item.sourceColorOverride !== "auto") {
+    return `已手动指定按 ${SOURCE_COLOR_LABELS[item.sourceColorOverride]} 解释，编码链以该设置为准。`;
+  }
+  if (isSuspectHdr(item)) {
+    return "源没写传递函数，但宽色域 + 10-bit 提示它可能是 HDR；为避免误判，目前仍按 SDR 编码（不改像素）。确认是手机 / 相机的 HLG 素材时选「按 HLG」。";
+  }
+  if (item.hdrMode !== "sdr") {
+    return `源已标注 ${hdrLabel(item.hdrMode)}，编码链按标注解释；怀疑标签写错时可以手动改写。`;
+  }
+  return "源按 SDR 处理。若这是丢了标签的 HLG / PQ 素材，手动指定后才会按 BT.2100 转换。";
 }
 
 function audioVisualLabel(visual: QueueItem["audioVisual"]) {

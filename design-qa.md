@@ -31,6 +31,7 @@ focused region comparison evidence: a separate crop was not required because bot
 - At 1180×760, `window.innerWidth`, document `scrollWidth` and screenshot width all equal 1180; there is no page-level horizontal overflow. The right inspector scrolls internally when needed.
 - Browser console error log checked after final reload: no errors.
 - Rechecked after the professional-settings pass: uncalibrated duration reads `待首次校准`; HLG/HDR10, 10-bit, 4:2:2, LUT, output strategy, naming and panorama preservation controls are available in the inspector; Dolby Vision is explicitly constrained to source-stream preservation.
+- HLG pass (2026-10-29): the inspector's 色彩 tab adds a `色调映射` select (自动 / BT.2408 直映射 / 软膝压缩高光 / 硬截顶, default 自动) that only appears when HDR 模式 is SDR, plus a hint line; the queue row can show an amber `HDR（未标注）` badge and the details modal gains a `源色彩解释` select (自动 / SDR / HLG / HDR10) alongside the probed HDR signal, mastering peak, MaxCLL/MaxFALL and coded-domain peak. `pnpm build` (tsc + vite) is clean; the colour math behind these controls is covered by `cargo test --lib` and `qa\hlg\verify-hlg.ps1`. Pixel-level UI screenshots of these two new controls have not been re-captured in this pass.
 - Final minimum-window evidence: `qa\implementation-final-1180.png`; `innerWidth` and document `scrollWidth` both equal 1180, while the inspector and queue use internal scrolling.
 
 ## Comparison History

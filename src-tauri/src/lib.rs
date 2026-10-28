@@ -127,6 +127,10 @@ struct Preset {
     color_space: String,
     #[serde(default = "default_hdr_mode")]
     hdr_mode: String,
+    /// 高光映射策略：auto（按源自动选择）/ bt2408（显示域直映射）/
+    /// tonemap（软膝色调映射）/ clip（硬截顶）。仅 HDR→SDR 时生效。
+    #[serde(default = "default_tone_map")]
+    tone_map: String,
     #[serde(
         default = "default_preset_bit_depth",
         deserialize_with = "deserialize_bit_depth"
@@ -174,6 +178,33 @@ struct QueueItem {
     color_transfer: String,
     #[serde(default = "default_hdr_mode")]
     hdr_mode: String,
+    /// 探测到的源 HDR 信号，含“疑似”态：sdr / hlg / hdr10 / dolby_vision /
+    /// hlg_suspect / hdr10_suspect。hdr_mode 保持传统四态，未确认的疑似源仍按 SDR 处理。
+    #[serde(default)]
+    hdr_signal: String,
+    /// 用户手动指定的源色彩解释：""|auto / sdr / hlg / hdr10。
+    /// 用于未标注或错标 HLG/PQ 的素材（ffprobe 读不到 arib-std-b67 时）。
+    #[serde(default)]
+    source_color_override: String,
+    /// ffprobe color_range：tv / pc / unspecified / unknown。
+    #[serde(default)]
+    color_range: String,
+    /// ffprobe color_space（矩阵），用于 primaries 缺失时的回退判断。
+    #[serde(default)]
+    color_matrix: String,
+    /// 来自帧 side_data 的母版显示元数据，x265 风格字符串；空表示未检出。
+    #[serde(default)]
+    mastering_display: String,
+    #[serde(default)]
+    max_cll: u32,
+    #[serde(default)]
+    max_fall: u32,
+    /// 母版峰值亮度 cd/m2；0 表示未携带 MDCV。
+    #[serde(default)]
+    peak_luminance: f64,
+    /// 抽样得到的编码域峰值（归一化到 0..1，1.0 = HLG/PQ 码值满量程）；0 表示未测。
+    #[serde(default)]
+    coded_peak_ratio: f64,
     #[serde(default)]
     audio_tracks: u32,
     #[serde(default)]
@@ -214,6 +245,61 @@ struct QueueItem {
 struct EncodeJob {
     item: QueueItem,
     preset: Preset,
+}
+
+/// Defaults mirror a pure-audio import so tests and callers can fill a
+/// `QueueItem` with `..QueueItem::default()` instead of repeating 40 fields.
+impl Default for QueueItem {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            source: String::new(),
+            file_name: "video".into(),
+            codec: String::new(),
+            width: 0,
+            height: 0,
+            fps: "30 fps".into(),
+            bitrate: 0,
+            duration: 0.0,
+            size_bytes: 0,
+            thumbnail: String::new(),
+            has_alpha: false,
+            is_panorama: false,
+            panorama_tagged: false,
+            bit_depth: 0,
+            chroma: "none".into(),
+            color_space: "n/a".into(),
+            color_transfer: "n/a".into(),
+            hdr_mode: "sdr".into(),
+            hdr_signal: "sdr".into(),
+            source_color_override: String::new(),
+            color_range: String::new(),
+            color_matrix: String::new(),
+            mastering_display: String::new(),
+            max_cll: 0,
+            max_fall: 0,
+            peak_luminance: 0.0,
+            coded_peak_ratio: 0.0,
+            audio_tracks: 0,
+            subtitle_tracks: 0,
+            preset_id: String::new(),
+            selected: true,
+            output: String::new(),
+            status: "等待中".into(),
+            progress: 0,
+            media_kind: default_media_kind(),
+            sequence_pattern: String::new(),
+            sequence_start_number: 0,
+            sequence_frame_count: 0,
+            sequence_fps: default_sequence_fps(),
+            sequence_pixel_aspect: default_pixel_aspect(),
+            sequence_frames: Vec::new(),
+            export_alpha_mask: false,
+            alpha_output: String::new(),
+            external_audio: String::new(),
+            audio_visual: default_audio_visual(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,7 +363,58 @@ fn phase_output_paths(output: &Path, phase: &EncodePhase) -> (String, Option<Str
     }
 }
 
+/// release 版是 GUI 子系统程序（`windows_subsystem = "windows"`），stderr 句柄无效，
+/// panic 与错误信息都会被系统直接丢弃，“双击后一闪而过”事后查不到任何痕迹。
+/// 这里把启动阶段和崩溃现场写进 exe 同目录的 `startup.log`（并在临时目录留一份副本），
+/// 让闪退可以被事后定位。定位完成后应连同 `install_startup_diagnostics` 一起移除。
+const STARTUP_LOG_NAME: &str = "startup.log";
+
+fn startup_log(message: &str) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let line = format!("[{stamp}] {message}\n");
+    for target in startup_log_targets() {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(target) {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+    }
+}
+
+fn startup_log_targets() -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            targets.push(directory.join(STARTUP_LOG_NAME));
+        }
+    }
+    targets.push(std::env::temp_dir().join(format!("videosize-composer-{STARTUP_LOG_NAME}")));
+    targets
+}
+
+fn install_startup_diagnostics() {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        startup_log(&format!("panic：{info}\n{backtrace}"));
+    }));
+    let exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "未知".into());
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "未知".into());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    startup_log(&format!(
+        "启动：版本 {}（{profile}）；exe={exe}；cwd={cwd}；参数={args:?}",
+        env!("CARGO_PKG_VERSION")
+    ));
+}
+
 pub fn run() {
+    install_startup_diagnostics();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -296,14 +433,17 @@ pub fn run() {
             reveal_path
         ])
         .setup(|app| {
+            startup_log("设置：窗口已创建，进入 setup");
             let path = presets_path(app.handle()).map_err(io::Error::other)?;
             if !path.exists() {
                 write_presets(&path, &default_presets())?;
             }
+            startup_log("设置：预设文件就绪，交给事件循环");
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running VideoSize Composer");
+        .unwrap_or_else(|error| startup_log(&format!("错误：事件循环返回 {error}")));
+    startup_log("退出：run 正常返回（窗口已全部关闭）");
 }
 
 #[tauri::command]
@@ -878,6 +1018,10 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
         })
         .collect::<Result<Vec<_>, _>>()?;
     let jobs = tauri::async_runtime::spawn_blocking(move || {
+        let mut jobs = jobs;
+        for job in jobs.iter_mut() {
+            prepare_source_peak(job);
+        }
         preflight_jobs(&jobs)?;
         Ok::<_, String>(jobs)
     })
@@ -917,6 +1061,26 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
         }
     });
     Ok(session_id)
+}
+
+/// `build_ffmpeg_args` 必须保持纯函数（单元测试直接调用它），所以高光映射策略要用的
+/// 编码域峰值在这里抽样一次写回 item；只在「HDR→SDR 且策略为 auto」时才解码。
+fn prepare_source_peak(job: &mut EncodeJob) {
+    job.item.coded_peak_ratio = 0.0;
+    if job.preset.hdr_mode != "sdr" || !matches!(job.preset.tone_map.as_str(), "" | "auto") {
+        return;
+    }
+    let src = source_color(&job.item);
+    if src.hdr_mode != "hlg" {
+        return;
+    }
+    if let Some(ratio) = sample_coded_peak_ratio(
+        Path::new(&job.item.source),
+        job.item.bit_depth,
+        src.range == "pc",
+    ) {
+        job.item.coded_peak_ratio = ratio;
+    }
 }
 
 fn preflight_jobs(jobs: &[EncodeJob]) -> Result<(), String> {
@@ -1040,6 +1204,12 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
     if preset.lut_enabled && !filter_available("lut3d") {
         return Err("当前 FFmpeg 不包含 lut3d 滤镜，无法套用 LUT".into());
     }
+    if !matches!(
+        preset.tone_map.as_str(),
+        "auto" | "bt2408" | "tonemap" | "clip"
+    ) {
+        return Err(format!("不支持的高光映射方式：{}", preset.tone_map));
+    }
     if (preset.color_space != "source"
         || !matches!(preset.hdr_mode.as_str(), "source" | "dolby_vision"))
         && !filter_available("zscale")
@@ -1116,6 +1286,47 @@ fn validate_job(job: &EncodeJob) -> Result<(), String> {
             "{} 的原视频不是 10-bit，HLG/HDR10 输出请明确选择 10-bit",
             job.item.file_name
         ));
+    }
+    let source_color = source_color(&job.item);
+    let source_label = if source_color.transfer == "arib-std-b67" {
+        "HLG"
+    } else {
+        "HDR10/PQ"
+    };
+    // 色调映射链依赖 tonemap 滤镜；不可用时明确指向可用的直映射，别让任务默默失败。
+    if job.preset.hdr_mode == "sdr"
+        && source_color.is_hdr()
+        && matches!(
+            tone_map_strategy(&job.item, &job.preset, &source_color),
+            ToneMapStrategy::ToneMap(_)
+        )
+        && !filter_available("tonemap")
+    {
+        return Err(
+            "当前 FFmpeg 不包含 tonemap 滤镜，无法压缩 HDR 高光；请把高光映射改为「BT.2408 直映射」"
+                .into(),
+        );
+    }
+    if source_color.is_hdr() && job.preset.hdr_mode == "source" {
+        // 「跟随源文件」下必须保住 HDR 信号，别悄悄退化成 8-bit BT.709。
+        if !matches!(job.preset.codec.as_str(), "h265" | "av1" | "prores") {
+            return Err(format!(
+                "“{}”是 {} 源视频，保持源色彩时请使用 H.265、AV1 或 ProRes；H.264 承载不了该传输曲线",
+                job.item.file_name, source_label
+            ));
+        }
+        if job.preset.color_space == "rec709" {
+            return Err(format!(
+                "“{}”是 {} 源视频，BT.709 色域承载不了该传输曲线；请改用「跟随源文件」或 Rec.2020",
+                job.item.file_name, source_label
+            ));
+        }
+        if resolved_bit_depth(&job.item, &job.preset) != 10 {
+            return Err(format!(
+                "“{}”是 {} 源视频，保持源色彩时必须使用 10-bit",
+                job.item.file_name, source_label
+            ));
+        }
     }
     if job.preset.hdr_mode == "dolby_vision" {
         if job.item.has_alpha {
@@ -1369,6 +1580,7 @@ fn preset_with_defaults(id: &str, name: &str, codec: &str, suffix: &str) -> Pres
         alpha_background: default_alpha_background(),
         color_space: default_color_space(),
         hdr_mode: default_hdr_mode(),
+        tone_map: default_tone_map(),
         bit_depth: default_preset_bit_depth(),
         chroma: default_preset_chroma(),
         lut_enabled: false,
@@ -1440,6 +1652,10 @@ fn default_color_space() -> String {
 
 fn default_hdr_mode() -> String {
     "source".into()
+}
+
+fn default_tone_map() -> String {
+    "auto".into()
 }
 
 fn default_alpha_background() -> String {
@@ -2019,6 +2235,19 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
     let pixel_format = video["pix_fmt"].as_str().unwrap_or("");
     let color_transfer = video["color_transfer"].as_str().unwrap_or("").to_string();
     let hdr_mode = detect_hdr_mode(&video);
+    let bit_depth = if has_video {
+        detect_bit_depth(&video, pixel_format)
+    } else {
+        0
+    };
+    // 母版显示元数据与 MaxCLL 只在 `-show_frames` 的帧 side_data 里出现，
+    // `-show_streams` 读不到；只对可能是 HDR 的素材多花一次 ~180 ms 的单帧探测。
+    let hdr_meta = if has_video && (bit_depth >= 10 || mentions_bt2020(&video)) {
+        probe_hdr_metadata(path)
+    } else {
+        HdrMetadata::default()
+    };
+    let hdr_signal = detect_hdr_signal(&video, &hdr_mode, &hdr_meta);
 
     let mut item = QueueItem {
         id: Uuid::new_v4().to_string(),
@@ -2059,24 +2288,28 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         has_alpha: has_video && detect_alpha_pixel_format(pixel_format),
         is_panorama: has_video && detect_panorama(&json),
         panorama_tagged: has_video && detect_panorama_tagged(&json),
-        bit_depth: if has_video {
-            detect_bit_depth(&video, pixel_format)
-        } else {
-            0
-        },
+        bit_depth,
         chroma: if has_video {
             detect_chroma(pixel_format)
         } else {
             "none".into()
         },
         color_space: if has_video {
-            video["color_primaries"]
-                .as_str()
-                .or_else(|| video["color_space"].as_str())
-                .unwrap_or("unknown")
-                .to_string()
+            valid_color_tag(&video, "color_primaries")
+                .or_else(|| valid_color_tag(&video, "color_space"))
+                .unwrap_or_else(|| "unknown".to_string())
         } else {
             "n/a".into()
+        },
+        color_matrix: if has_video {
+            valid_color_tag(&video, "color_space").unwrap_or_default()
+        } else {
+            String::new()
+        },
+        color_range: if has_video {
+            video["color_range"].as_str().unwrap_or("").to_string()
+        } else {
+            String::new()
         },
         color_transfer: if has_video {
             color_transfer
@@ -2084,6 +2317,13 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
             "n/a".into()
         },
         hdr_mode: if has_video { hdr_mode } else { "sdr".into() },
+        hdr_signal: if has_video { hdr_signal } else { "sdr".into() },
+        source_color_override: String::new(),
+        mastering_display: hdr_meta.mastering_display,
+        max_cll: hdr_meta.max_cll,
+        max_fall: hdr_meta.max_fall,
+        peak_luminance: hdr_meta.peak_luminance,
+        coded_peak_ratio: 0.0,
         audio_tracks: streams
             .iter()
             .filter(|stream| stream["codec_type"] == "audio")
@@ -3236,57 +3476,163 @@ fn alpha_background_filter(background: &str) -> String {
     )
 }
 
-fn color_conversion_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
-    if preset.color_space == "source" && preset.hdr_mode == "source" {
-        return None;
+/// 源素材的色彩解释。用户可以用 `source_color_override` 覆盖探测结果，
+/// 这是未标注/错标 HLG 素材唯一的纠正入口。
+#[derive(Debug, Clone, PartialEq)]
+struct SourceColor {
+    primaries: &'static str,
+    transfer: &'static str,
+    matrix: &'static str,
+    range: &'static str,
+    hdr_mode: &'static str,
+}
+
+impl SourceColor {
+    fn is_hdr(&self) -> bool {
+        matches!(self.hdr_mode, "hlg" | "hdr10" | "dolby_vision")
     }
-    let input_primaries = normalized_primaries(&item.color_space);
-    let input_transfer = normalized_transfer(&item.color_transfer);
-    let input_matrix = if input_primaries == "bt2020" {
+}
+
+/// 用户确认过的源色彩解释。未确认的“疑似 HDR”仍按 SDR 处理，
+/// 以免把普通 10-bit 宽色域素材误当 HDR。
+fn effective_hdr_mode(item: &QueueItem) -> &'static str {
+    match item.source_color_override.as_str() {
+        "sdr" => return "sdr",
+        "hlg" => return "hlg",
+        "hdr10" => return "hdr10",
+        _ => {}
+    }
+    match item.hdr_signal.as_str() {
+        "dolby_vision" => "dolby_vision",
+        "hlg" => "hlg",
+        "hdr10" => "hdr10",
+        _ => "sdr",
+    }
+}
+
+fn source_color(item: &QueueItem) -> SourceColor {
+    let hdr_mode = effective_hdr_mode(item);
+    let transfer = match hdr_mode {
+        "hlg" => "arib-std-b67",
+        "hdr10" => "smpte2084",
+        _ => normalized_transfer(&item.color_transfer),
+    };
+    // 色域判定顺序：显式的 BT.2020 标注（三原色或矩阵任一）→ HDR 传输曲线
+    // （HLG/PQ 必然配 BT.2020）→ 兜底 BT.709。
+    let wide_gamut = item.color_space.contains("2020")
+        || item.color_matrix.contains("2020")
+        || matches!(transfer, "arib-std-b67" | "smpte2084");
+    let primaries = if wide_gamut { "bt2020" } else { "bt709" };
+    let matrix = if item.color_matrix.contains("709") {
+        "bt709"
+    } else if item.color_matrix.contains("2020") || wide_gamut {
         "bt2020nc"
     } else {
         "bt709"
     };
-    let input = format!(
-        "zscale=primariesin={input_primaries}:transferin={input_transfer}:matrixin={input_matrix}:rangein=tv:primaries={input_primaries}:transfer=linear:npl=100,format=gbrpf32le"
-    );
+    SourceColor {
+        primaries,
+        transfer,
+        matrix,
+        range: normalized_range(&item.color_range),
+        hdr_mode,
+    }
+}
+
+/// 输出侧要写的标签。滤镜链的目标色彩也必须由它算出——两边各自算一遍时
+/// 出现过“像素已转成 709、标签仍写 bt2020”的错配。
+fn output_color(item: &QueueItem, preset: &Preset) -> (&'static str, &'static str, &'static str) {
+    let src = source_color(item);
     match preset.hdr_mode.as_str() {
-        "sdr" => {
-            let tone_map = if matches!(item.hdr_mode.as_str(), "hlg" | "hdr10" | "dolby_vision") {
-                ",tonemap=hable:desat=0"
-            } else {
-                ""
-            };
-            Some(format!(
-                "{input}{tone_map},zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=tv,format={}",
-                pixel_format(item, preset)
-            ))
-        }
-        "hlg" => Some(format!(
-            "{input},zscale=primaries=bt2020:transfer=arib-std-b67:matrix=bt2020nc:range=tv,format={}",
-            pixel_format(item, preset)
-        )),
-        "hdr10" => Some(format!(
-            "{input},zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc:range=tv,format={}",
-            pixel_format(item, preset)
-        )),
+        "sdr" => ("bt709", "bt709", "bt709"),
+        "hlg" => ("bt2020", "arib-std-b67", "bt2020nc"),
+        "hdr10" => ("bt2020", "smpte2084", "bt2020nc"),
         _ => {
-            let target = if preset.color_space == "rec2020" { "bt2020" } else { "bt709" };
-            let matrix = if target == "bt2020" { "bt2020nc" } else { "bt709" };
-            Some(format!(
-                "{input},zscale=primaries={target}:transfer={input_transfer}:matrix={matrix}:range=tv,format={}",
-                pixel_format(item, preset)
-            ))
+            let primaries = match preset.color_space.as_str() {
+                "rec2020" => "bt2020",
+                "rec709" => "bt709",
+                _ => src.primaries,
+            };
+            // HLG/PQ 传输曲线只能配 BT.2020；validate_job 会先拦住这种组合，
+            // 这里再兜一层，保证任何路径下标签和像素都不会自相矛盾。
+            let primaries = if matches!(src.transfer, "arib-std-b67" | "smpte2084") {
+                "bt2020"
+            } else {
+                primaries
+            };
+            let matrix = if primaries == "bt2020" { "bt2020nc" } else { "bt709" };
+            (primaries, src.transfer, matrix)
         }
     }
 }
 
-fn normalized_primaries(value: &str) -> &'static str {
-    if value.contains("2020") {
-        "bt2020"
-    } else {
-        "bt709"
+/// HDR→SDR 的高光映射策略。
+enum ToneMapStrategy {
+    /// BT.2408 的显示域匹配：一次 zscale 直接换传递函数。
+    Display,
+    /// 线性化后套软膝色调映射（保留超过 SDR 白电平的高光）。
+    ToneMap(&'static str),
+}
+
+/// auto 的判据：HLG 是场景参考信号，未标注的“HLG”常常只是 SDR 亮度域，
+/// 此时直映射实测 23.4 dB（无脑色调映射只有 15.3 dB、Ymax 被压到 140）；
+/// 而真有 1000 cd/m2 峰值的广电 HLG 直映射会让 Ymax 冲到 255，必须软膝。
+/// 有 MDCV/MaxCLL 或实测编码域峰值 ≥0.80 才认定“真的是 HDR”。
+fn tone_map_strategy(item: &QueueItem, preset: &Preset, src: &SourceColor) -> ToneMapStrategy {
+    match preset.tone_map.as_str() {
+        "bt2408" => return ToneMapStrategy::Display,
+        "tonemap" => return ToneMapStrategy::ToneMap("hable"),
+        "clip" => return ToneMapStrategy::ToneMap("clip"),
+        _ => {}
     }
+    if src.hdr_mode != "hlg" {
+        // PQ/杜比视界是显示参考信号，峰值固定远超 SDR，永远需要压缩高光。
+        return ToneMapStrategy::ToneMap("hable");
+    }
+    if item.peak_luminance >= 600.0 || item.max_cll >= 300 || item.coded_peak_ratio >= 0.80 {
+        ToneMapStrategy::ToneMap("hable")
+    } else {
+        ToneMapStrategy::Display
+    }
+}
+
+fn color_conversion_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
+    if preset.color_space == "source" && preset.hdr_mode == "source" {
+        return None;
+    }
+    let src = source_color(item);
+    let pixel = pixel_format(item, preset);
+    let input = format!(
+        "primariesin={}:transferin={}:matrixin={}:rangein={}",
+        src.primaries, src.transfer, src.matrix, src.range
+    );
+
+    if preset.hdr_mode == "sdr" && src.is_hdr() {
+        return Some(match tone_map_strategy(item, preset, &src) {
+            ToneMapStrategy::Display => format!(
+                "zscale={input}:primaries=bt709:transfer=bt709:matrix=bt709:range=tv,format={pixel}"
+            ),
+            ToneMapStrategy::ToneMap(algorithm) => format!(
+                "zscale={input}:primaries=bt2020:transfer=linear,format=gbrpf32le,tonemap={algorithm}:desat=0,zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=tv,format={pixel}"
+            ),
+        });
+    }
+
+    let (primaries, transfer, matrix) = output_color(item, preset);
+    if (primaries, transfer, matrix) == (src.primaries, src.transfer, src.matrix) {
+        // 同域转换交给 -pix_fmt 就够了，省掉一次 float 往返。
+        return None;
+    }
+    if matches!(transfer, "arib-std-b67" | "smpte2084") {
+        // 编成 HDR：必须经线性光再套目标 OETF。
+        return Some(format!(
+            "zscale={input}:primaries={}:transfer=linear,format=gbrpf32le,zscale=primaries={primaries}:transfer={transfer}:matrix={matrix}:range=tv,format={pixel}",
+            src.primaries
+        ));
+    }
+    Some(format!(
+        "zscale={input}:primaries={primaries}:transfer={transfer}:matrix={matrix}:range=tv,format={pixel}"
+    ))
 }
 
 fn normalized_transfer(value: &str) -> &'static str {
@@ -3297,21 +3643,18 @@ fn normalized_transfer(value: &str) -> &'static str {
     }
 }
 
+/// ffprobe 的 color_range：pc/full/jpeg 是全范围，其余按有限范围处理。
+/// 之前 rangein 被写死成 tv，真·全范围的 HLG 素材（录屏、部分手机代理）会被
+/// 整体错位约 1 档（实测 31–32 dB）。
+fn normalized_range(value: &str) -> &'static str {
+    match value.to_ascii_lowercase().as_str() {
+        "pc" | "full" | "jpeg" => "pc",
+        _ => "tv",
+    }
+}
+
 fn add_color_output_args(args: &mut Vec<String>, item: &QueueItem, preset: &Preset, encoder: &str) {
-    let (primaries, transfer, matrix) = match preset.hdr_mode.as_str() {
-        "sdr" => ("bt709", "bt709", "bt709"),
-        "hlg" => ("bt2020", "arib-std-b67", "bt2020nc"),
-        "hdr10" => ("bt2020", "smpte2084", "bt2020nc"),
-        _ => (
-            normalized_primaries(&item.color_space),
-            normalized_transfer(&item.color_transfer),
-            if normalized_primaries(&item.color_space) == "bt2020" {
-                "bt2020nc"
-            } else {
-                "bt709"
-            },
-        ),
-    };
+    let (primaries, transfer, matrix) = output_color(item, preset);
     args.extend([
         "-color_primaries".into(),
         primaries.into(),
@@ -3323,9 +3666,22 @@ fn add_color_output_args(args: &mut Vec<String>, item: &QueueItem, preset: &Pres
         "tv".into(),
     ]);
     if preset.hdr_mode == "hdr10" && encoder == "libx265" {
+        // 优先沿用源素材自带的母版显示元数据与 MaxCLL，没有才回落到 BT.2020 默认值。
+        let mastering_display = if item.mastering_display.is_empty() {
+            "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)".to_string()
+        } else {
+            format!("master-display={}", item.mastering_display)
+        };
+        let max_cll = if item.max_cll > 0 && item.max_fall > 0 {
+            format!("max-cll={},{}", item.max_cll, item.max_fall)
+        } else {
+            "max-cll=1000,400".to_string()
+        };
         args.extend([
             "-x265-params".into(),
-            "hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400".into(),
+            format!(
+                "hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:{mastering_display}:{max_cll}"
+            ),
         ]);
     }
 }
@@ -4035,6 +4391,218 @@ fn verify_spherical_metadata(path: &Path) -> Result<(), String> {
         .ok_or_else(|| "全景元数据写入后未通过 ffprobe 复核".into())
 }
 
+/// ffprobe 在字段缺失时会给出 "unknown"/"unspecified" 这类占位值：它们“存在”但
+/// 不代表任何色域，必须当作没读到，否则 `or_else` 回退永远不会触发。
+fn valid_color_tag(video: &Value, key: &str) -> Option<String> {
+    video[key]
+        .as_str()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| {
+            !value.is_empty()
+                && value != "unknown"
+                && value != "unspecified"
+                && value != "reserved"
+        })
+}
+
+fn mentions_bt2020(video: &Value) -> bool {
+    ["color_primaries", "color_space"]
+        .iter()
+        .filter_map(|key| valid_color_tag(video, key))
+        .any(|value| value.contains("2020"))
+}
+
+/// 帧 side_data 里的 HDR 静态元数据。`-show_streams` 读不到它们，必须解一帧。
+#[derive(Debug, Clone, Default)]
+struct HdrMetadata {
+    mastering_display: String,
+    max_cll: u32,
+    max_fall: u32,
+    peak_luminance: f64,
+}
+
+fn probe_hdr_metadata(path: &Path) -> HdrMetadata {
+    let output = command_with_hidden_window(resolve_tool("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            // 只解首帧：母版元数据在 SPS/SEI 中逐帧一致，整片解码对 4K HDR 素材太贵。
+            "-read_intervals",
+            "%+#1",
+            "-show_frames",
+            "-show_entries",
+            "frame=side_data_list",
+            "-print_format",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
+        .unwrap_or(Value::Null);
+    parse_hdr_metadata(&output)
+}
+
+fn parse_hdr_metadata(json: &Value) -> HdrMetadata {
+    let mut meta = HdrMetadata::default();
+    let entries = json["frames"]
+        .as_array()
+        .and_then(|frames| frames.first())
+        .and_then(|frame| frame["side_data_list"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    // ffprobe 用 1/50000（色度）与 1/10000 cd/m2（亮度）的有理数表示，
+    // 分子正好是 x265 `master-display=` 需要的单位，直接取分子即可。
+    let unit = |entry: &Value, key: &str| {
+        entry[key]
+            .as_str()
+            .and_then(|value| value.split('/').next())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    for entry in &entries {
+        match entry["side_data_type"].as_str().unwrap_or("") {
+            "Mastering display metadata" => {
+                let values = [
+                    "red_x",
+                    "red_y",
+                    "green_x",
+                    "green_y",
+                    "blue_x",
+                    "blue_y",
+                    "white_point_x",
+                    "white_point_y",
+                    "min_luminance",
+                    "max_luminance",
+                ]
+                .map(|key| unit(entry, key));
+                if values.iter().all(|value| value.is_some()) {
+                    let [red_x, red_y, green_x, green_y, blue_x, blue_y, white_x, white_y, min_luma, max_luma] =
+                        values.map(|value| value.unwrap_or_default());
+                    meta.mastering_display = format!(
+                        "G({green_x},{green_y})B({blue_x},{blue_y})R({red_x},{red_y})WP({white_x},{white_y})L({max_luma},{min_luma})"
+                    );
+                }
+                meta.peak_luminance = entry["max_luminance"]
+                    .as_str()
+                    .and_then(rational_to_f64)
+                    .unwrap_or(0.0);
+            }
+            "Content light level metadata" => {
+                meta.max_cll = entry["max_content"].as_u64().unwrap_or(0) as u32;
+                meta.max_fall = entry["max_average"].as_u64().unwrap_or(0) as u32;
+            }
+            _ => {}
+        }
+    }
+    meta
+}
+
+fn rational_to_f64(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator: f64 = numerator.trim().parse().ok()?;
+    let denominator: f64 = denominator.trim().parse().ok().filter(|value| *value != 0.0)?;
+    Some(numerator / denominator)
+}
+
+/// 在 ffprobe 的三态之外补一个“疑似 HDR”态。未标注/错标的 HLG（电视导出、部分相机、
+/// HDR 信号只写在容器 colr 里）只凭 color_transfer 会被判成 SDR，然后静默产出
+/// 发灰偏暗的片子。这里只负责标记，具体按什么解释交给用户确认。
+fn detect_hdr_signal(video: &Value, hdr_mode: &str, meta: &HdrMetadata) -> String {
+    if hdr_mode != "sdr" {
+        return hdr_mode.to_string();
+    }
+    if !matches!(
+        video["color_transfer"].as_str().unwrap_or(""),
+        "" | "unknown" | "unspecified"
+    ) {
+        // trc 明确写着 bt709 之类：按 SDR 处理，错标交给用户手动覆盖，避免误伤普通素材。
+        return "sdr".into();
+    }
+    let bit_depth = detect_bit_depth(video, video["pix_fmt"].as_str().unwrap_or(""));
+    let wide_gamut = mentions_bt2020(video);
+    if (meta.peak_luminance >= 300.0 || meta.max_cll > 0) && (wide_gamut || bit_depth >= 10) {
+        return "hdr10_suspect".into();
+    }
+    if wide_gamut && bit_depth >= 10 {
+        // 未标注的宽色域 10-bit 素材绝大多数是消费设备录的 HLG。
+        return "hlg_suspect".into();
+    }
+    "sdr".into()
+}
+
+/// 把 signalstats 的 YMAX 换算成归一化编码域峰值（1.0 = HLG/PQ 的码值满量程）。
+fn coded_peak_ratio(ymax: f64, bit_depth: u32, full_range: bool) -> f64 {
+    let steps = if bit_depth >= 12 {
+        4096.0
+    } else if bit_depth >= 10 {
+        1024.0
+    } else {
+        256.0
+    };
+    let black = if full_range { 0.0 } else { steps / 16.0 };
+    let white = if full_range {
+        steps - 1.0
+    } else {
+        steps * 235.0 / 256.0
+    };
+    ((ymax - black) / (white - black)).clamp(0.0, 4.0)
+}
+
+/// 从 signalstats 的日志输出里取某个统计量的最大值。`metadata=print` 不带 `file=`
+/// 时通过 av_log 打到 stderr，避免把 Windows 绝对路径塞进滤镜图（冒号转义会炸）。
+fn max_signalstat(output: &[u8], key: &str) -> Option<f64> {
+    let text = String::from_utf8_lossy(output);
+    let marker = format!("lavfi.signalstats.{key}=");
+    text.lines()
+        .filter_map(|line| line.split_once(&marker))
+        .filter_map(|(_, value)| {
+            value
+                .trim()
+                .split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                .next()
+                .and_then(|head| head.parse::<f64>().ok())
+        })
+        .fold(None, |acc: Option<f64>, value| {
+            Some(acc.map_or(value, |acc: f64| acc.max(value)))
+        })
+}
+
+/// HLG 是场景参考信号：手机/调色台出来的“HLG”峰值常只到码值 0.6 左右，广电 HLG 会打到
+/// 1.0，两者需要的高光映射完全不同（实测直映射在后者的 Ymax 会冲到 255）。编码域峰值
+/// 是唯一能区分它们的实测依据，用只解关键帧的方式抽样，避免整片解码。
+fn sample_coded_peak_ratio(path: &Path, bit_depth: u32, full_range: bool) -> Option<f64> {
+    if !filter_available("signalstats") {
+        return None;
+    }
+    let mut command = command_with_hidden_window(resolve_tool("ffmpeg"));
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-skip_frame",
+            "nokey",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            "signalstats,metadata=print",
+            "-f",
+            "null",
+            "-",
+        ]);
+    let output = command.output().ok()?;
+    let ymax = max_signalstat(&output.stderr, "YMAX")?;
+    Some(coded_peak_ratio(ymax, bit_depth, full_range))
+}
+
 fn detect_hdr_mode(video: &Value) -> String {
     let text = video.to_string().to_ascii_lowercase();
     if text.contains("dovi configuration record")
@@ -4395,6 +4963,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
         let filter = video_filter_with_exe_dir(&item, &preset, &exe_dir).unwrap();
         assert!(filter.contains("lut3d=file='"));
@@ -4549,6 +5118,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
 
         let mut av1 = preset_with_defaults("av1", "AV1", "av1", "_av1");
@@ -4681,6 +5251,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
 
         // 默认“保持原帧率”不输出 -r
@@ -4796,6 +5367,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
         let mut preset = preset_with_defaults("alpha", "Alpha", "h264", "_alpha");
         for (background, expected) in [("checkerboard", "192"), ("black", "0"), ("white", "255")] {
@@ -5118,6 +5690,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
         let mut preset = preset_with_defaults("preset", "Preset", "h265", "_压缩");
         preset.prefix = "交付_".into();
@@ -5194,6 +5767,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
         let mut preset = preset_with_defaults("prores-estimate", "ProRes", "prores", "_prores");
         preset.resolution_mode = "source".into();
@@ -5263,6 +5837,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
         let mut preset = preset_with_defaults("large-prores", "ProRes", "prores", "_prores");
         preset.hdr_mode = "hdr10".into();
@@ -5537,6 +6112,7 @@ mod tests {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            ..QueueItem::default()
         };
         preflight_jobs(&[EncodeJob { item, preset }]).unwrap();
         assert!(output_dir.is_dir());
@@ -6026,6 +6602,433 @@ mod tests {
         let streams = probe_stream_types(&output);
         assert!(streams.iter().any(|stream| stream["codec_type"] == "video"));
         assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn hlg_item() -> QueueItem {
+        QueueItem {
+            id: "hlg-item".into(),
+            source: "hlg.mp4".into(),
+            file_name: "hlg.mp4".into(),
+            codec: "HEVC".into(),
+            width: 3840,
+            height: 2160,
+            fps: "50 fps".into(),
+            bitrate: 80_000_000,
+            duration: 10.0,
+            size_bytes: 10_000_000,
+            bit_depth: 10,
+            chroma: "420".into(),
+            color_space: "bt2020".into(),
+            color_matrix: "bt2020nc".into(),
+            color_transfer: "arib-std-b67".into(),
+            color_range: "tv".into(),
+            hdr_mode: "hlg".into(),
+            hdr_signal: "hlg".into(),
+            ..QueueItem::default()
+        }
+    }
+
+    fn sdr_target_preset() -> Preset {
+        let mut preset = preset_with_defaults("sdr", "SDR", "h264", "_sdr");
+        preset.color_space = "rec709".into();
+        preset.hdr_mode = "sdr".into();
+        preset.bit_depth = "8".into();
+        preset
+    }
+
+    fn color_filter_of(item: &QueueItem, preset: &Preset) -> String {
+        color_conversion_filter(item, preset).expect("预期生成色彩滤镜链")
+    }
+
+    #[test]
+    fn hlg_to_sdr_keeps_display_referred_luma_for_sdr_dynamic_range() {
+        // 手机/相机出来的“HLG”峰值常常只到码值 0.6，直映射才贴近原始 SDR。
+        let mut item = hlg_item();
+        item.coded_peak_ratio = 0.59;
+        let filter = color_filter_of(&item, &sdr_target_preset());
+        assert!(filter.contains("transferin=arib-std-b67"));
+        assert!(filter.contains("primaries=bt709:transfer=bt709:matrix=bt709"));
+        assert!(!filter.contains("tonemap"));
+        assert!(!filter.contains("gbrpf32le"));
+        assert!(filter.contains("rangein=tv"));
+    }
+
+    #[test]
+    fn hlg_to_sdr_compresses_highlights_only_for_true_hdr() {
+        let mut item = hlg_item();
+        item.coded_peak_ratio = 1.0;
+        assert!(color_filter_of(&item, &sdr_target_preset()).contains("tonemap=hable:desat=0"));
+
+        let mut item = hlg_item();
+        item.peak_luminance = 1000.0;
+        assert!(color_filter_of(&item, &sdr_target_preset()).contains("tonemap=hable"));
+
+        let mut item = hlg_item();
+        item.max_cll = 600;
+        assert!(color_filter_of(&item, &sdr_target_preset()).contains("tonemap=hable"));
+
+        // PQ 是显示参考信号，峰值固定远超 SDR，永远需要压缩高光。
+        let mut pq = hlg_item();
+        pq.color_transfer = "smpte2084".into();
+        pq.hdr_mode = "hdr10".into();
+        pq.hdr_signal = "hdr10".into();
+        assert!(color_filter_of(&pq, &sdr_target_preset()).contains("tonemap=hable"));
+    }
+
+    #[test]
+    fn tone_map_choice_follows_the_preset_override() {
+        let mut item = hlg_item();
+        item.coded_peak_ratio = 1.0;
+        let mut preset = sdr_target_preset();
+        preset.tone_map = "bt2408".into();
+        assert!(!color_filter_of(&item, &preset).contains("tonemap"));
+        preset.tone_map = "clip".into();
+        assert!(color_filter_of(&item, &preset).contains("tonemap=clip:desat=0"));
+        preset.tone_map = "tonemap".into();
+        assert!(color_filter_of(&item, &preset).contains("tonemap=hable"));
+        assert!(validate_preset(&preset).is_ok());
+        preset.tone_map = "bt2390".into();
+        assert!(validate_preset(&preset).is_err());
+    }
+
+    #[test]
+    fn placeholder_colour_tags_fall_back_instead_of_claiming_a_gamut() {
+        let video: Value = serde_json::json!({
+            "color_primaries": "unknown",
+            "color_space": "bt2020nc"
+        });
+        assert_eq!(valid_color_tag(&video, "color_primaries"), None);
+        assert_eq!(valid_color_tag(&video, "color_space").unwrap(), "bt2020nc");
+        assert!(mentions_bt2020(&video));
+
+        let plain: Value = serde_json::json!({
+            "color_primaries": "unspecified",
+            "color_space": "unknown"
+        });
+        assert!(!mentions_bt2020(&plain));
+        assert_eq!(valid_color_tag(&plain, "color_space"), None);
+    }
+
+    #[test]
+    fn unlabelled_hlg_is_flagged_but_stays_sdr_until_confirmed() {
+        let video: Value = serde_json::json!({
+            "codec_type": "video",
+            "pix_fmt": "yuv420p10le",
+            "color_primaries": "bt2020",
+            "color_space": "bt2020nc",
+            "color_transfer": "unknown",
+            "color_range": "tv"
+        });
+        let meta = HdrMetadata::default();
+        assert_eq!(detect_hdr_signal(&video, "sdr", &meta), "hlg_suspect");
+
+        let mut labelled = video.clone();
+        labelled["color_transfer"] = serde_json::json!("bt709");
+        assert_eq!(detect_hdr_signal(&labelled, "sdr", &meta), "sdr");
+
+        let mut bt2020_pq = video.clone();
+        bt2020_pq["color_transfer"] = serde_json::json!("unknown");
+        let with_mdcv = HdrMetadata {
+            mastering_display: "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+                .into(),
+            max_cll: 0,
+            max_fall: 0,
+            peak_luminance: 1000.0,
+        };
+        assert_eq!(detect_hdr_signal(&bt2020_pq, "sdr", &with_mdcv), "hdr10_suspect");
+        assert_eq!(detect_hdr_signal(&video, "hlg", &meta), "hlg");
+
+        // 未经用户确认：疑似 HLG 仍按 SDR 处理，绝不擅自重新解释像素。
+        let mut item = QueueItem {
+            id: "suspect".into(),
+            source: "suspect.mp4".into(),
+            file_name: "suspect.mp4".into(),
+            bit_depth: 10,
+            chroma: "420".into(),
+            color_space: "bt2020".into(),
+            color_matrix: "bt2020nc".into(),
+            color_transfer: "unknown".into(),
+            hdr_signal: "hlg_suspect".into(),
+            duration: 10.0,
+            bitrate: 20_000_000,
+            size_bytes: 10_000_000,
+            ..QueueItem::default()
+        };
+        let source = source_color(&item);
+        assert_eq!(source.hdr_mode, "sdr");
+        assert_eq!(source.transfer, "bt709");
+        assert!(!source.is_hdr());
+
+        // 用户在检查器里确认之后才按 HLG 解释。
+        item.source_color_override = "hlg".into();
+        let source = source_color(&item);
+        assert_eq!(source.hdr_mode, "hlg");
+        assert_eq!(source.transfer, "arib-std-b67");
+        assert_eq!(source.primaries, "bt2020");
+        assert_eq!(source.matrix, "bt2020nc");
+        assert!(color_filter_of(&item, &sdr_target_preset()).contains("transferin=arib-std-b67"));
+
+        // 也可以明确否决掉探测结果。
+        item.source_color_override = "sdr".into();
+        let filter = color_filter_of(&item, &sdr_target_preset());
+        assert!(filter.contains("transferin=bt709"));
+    }
+
+    #[test]
+    fn hdr_static_metadata_is_read_from_frame_side_data() {
+        let json: Value = serde_json::json!({
+            "frames": [{
+                "side_data_list": [
+                    {
+                        "side_data_type": "Mastering display metadata",
+                        "red_x": "34000/50000", "red_y": "16000/50000",
+                        "green_x": "13250/50000", "green_y": "34500/50000",
+                        "blue_x": "7500/50000", "blue_y": "3000/50000",
+                        "white_point_x": "15635/50000", "white_point_y": "16450/50000",
+                        "min_luminance": "1/10000", "max_luminance": "10000000/10000"
+                    },
+                    {
+                        "side_data_type": "Content light level metadata",
+                        "max_content": 700,
+                        "max_average": 200
+                    }
+                ]
+            }]
+        });
+        let meta = parse_hdr_metadata(&json);
+        assert_eq!(
+            meta.mastering_display,
+            "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+        );
+        assert_eq!((meta.max_cll, meta.max_fall), (700, 200));
+        assert_eq!(meta.peak_luminance, 1000.0);
+
+        let empty = parse_hdr_metadata(&serde_json::json!({}));
+        assert!(empty.mastering_display.is_empty());
+        assert_eq!((empty.max_cll, empty.max_fall, empty.peak_luminance), (0, 0, 0.0));
+    }
+
+    #[test]
+    fn hdr10_tags_reuse_the_source_mastering_metadata() {
+        let mut item = hlg_item();
+        item.color_transfer = "smpte2084".into();
+        item.hdr_mode = "hdr10".into();
+        item.hdr_signal = "hdr10".into();
+        item.mastering_display =
+            "G(9500,39760)B(26904,10520)R(13240,34500)WP(15635,16450)L(10000000,10)".into();
+        item.max_cll = 700;
+        item.max_fall = 200;
+        let mut preset = preset_with_defaults("hdr10", "HDR10", "h265", "_hdr10");
+        preset.hdr_mode = "hdr10".into();
+        preset.color_space = "rec2020".into();
+        let args = build_ffmpeg_args(&item, &preset, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("master-display=G(9500,39760)B(26904,10520)R(13240,34500)WP(15635,16450)L(10000000,10)"));
+        assert!(args.contains("max-cll=700,200"));
+        assert!(!args.contains("max-cll=1000,400"));
+
+        // 源没带元数据时回落到 BT.2020 默认值。
+        item.mastering_display = String::new();
+        item.max_cll = 0;
+        let fallback = build_ffmpeg_args(&item, &preset, Path::new("out.mp4")).join(" ");
+        assert!(fallback.contains("master-display=G(13250,34500)"));
+        assert!(fallback.contains("max-cll=1000,400"));
+    }
+
+    #[test]
+    fn colour_labels_follow_the_pixels_after_conversion() {
+        let mut item = hlg_item();
+        item.coded_peak_ratio = 0.59;
+        let args = build_ffmpeg_args(&item, &sdr_target_preset(), Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-color_primaries bt709"));
+        assert!(args.contains("-color_trc bt709"));
+        assert!(args.contains("-colorspace bt709"));
+
+        // 「跟随源文件」保持源标签。
+        let follow = preset_with_defaults("follow", "跟随源文件", "h265", "_follow");
+        let args = build_ffmpeg_args(&item, &follow, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-color_primaries bt2020"));
+        assert!(args.contains("-color_trc arib-std-b67"));
+        assert!(args.contains("-colorspace bt2020nc"));
+
+        // 全范围源必须按 pc 解释，否则整体错位一档。
+        let mut full = hlg_item();
+        full.color_range = "pc".into();
+        assert!(color_filter_of(&full, &sdr_target_preset()).contains("rangein=pc"));
+        assert!(color_filter_of(&item, &sdr_target_preset()).contains("rangein=tv"));
+    }
+
+    #[test]
+    fn keeping_an_hdr_source_refuses_lossy_targets() {
+        let item = hlg_item();
+        let mut follow = preset_with_defaults("follow", "跟随源文件", "h264", "_follow");
+        assert!(validate_job(&EncodeJob { item: item.clone(), preset: follow.clone() }).is_err());
+        follow.codec = "h265".into();
+        assert!(validate_job(&EncodeJob { item: item.clone(), preset: follow.clone() }).is_ok());
+        let mut rec709 = follow.clone();
+        rec709.color_space = "rec709".into();
+        assert!(validate_job(&EncodeJob { item: item.clone(), preset: rec709 }).is_err());
+        let mut eight_bit = follow.clone();
+        eight_bit.bit_depth = "8".into();
+        assert!(validate_job(&EncodeJob { item: item.clone(), preset: eight_bit }).is_err());
+        // 用户确认过只是 SDR 的素材不受这条限制。
+        let mut denied = item.clone();
+        denied.source_color_override = "sdr".into();
+        let h264 = preset_with_defaults("follow", "跟随源文件", "h264", "_follow");
+        assert!(validate_job(&EncodeJob { item: denied, preset: h264 }).is_ok());
+    }
+
+    #[test]
+    fn coded_peak_ratio_normalises_coded_range_and_depth() {
+        assert_eq!(coded_peak_ratio(940.0, 10, false), 1.0);
+        assert!((coded_peak_ratio(616.0, 10, false) - 0.629).abs() < 0.01);
+        assert_eq!(coded_peak_ratio(235.0, 8, false), 1.0);
+        assert_eq!(coded_peak_ratio(1023.0, 10, true), 1.0);
+        assert_eq!(coded_peak_ratio(64.0, 10, false), 0.0);
+        assert_eq!(coded_peak_ratio(0.0, 10, false), 0.0);
+        assert_eq!(coded_peak_ratio(3760.0, 12, false), 1.0);
+        assert_eq!(coded_peak_ratio(9999.0, 10, false), 4.0);
+    }
+
+    fn encode_clip(args: &[&str], output: &Path) {
+        let status = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(args)
+            .arg(output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg 生成素材失败：{}", output.display());
+    }
+
+    fn mean_luma(path: &Path) -> f64 {
+        let output = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(["-hide_banner", "-loglevel", "info", "-i"])
+            .arg(path)
+            .args(["-vf", "signalstats,metadata=print", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "signalstats 失败：{}", path.display());
+        let values: Vec<f64> = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| line.split_once("lavfi.signalstats.YAVG="))
+            .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+            .collect();
+        assert!(!values.is_empty(), "没有采到 YAVG：{}", path.display());
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+
+    #[test]
+    fn auto_tone_map_keeps_hlg_sdr_luma_close_to_the_sdr_master() {
+        let root = std::env::temp_dir().join(format!("vsc-hlg-sdr-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let master = root.join("sdr-master.mp4");
+        encode_clip(
+            &[
+                "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24", "-t", "0.5",
+                "-c:v", "libx265", "-preset", "ultrafast", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-color_primaries", "bt709", "-color_trc", "bt709",
+                "-colorspace", "bt709", "-color_range", "tv",
+            ],
+            &master,
+        );
+        // 同一批帧套上 HLG OETF，等价于相机直出的“未打峰值”HLG 素材。
+        let hlg = root.join("sdr-referred-hlg.mp4");
+        encode_clip(
+            &[
+                "-i", &master.to_string_lossy(),
+                "-vf",
+                "zscale=primariesin=bt709:transferin=bt709:matrixin=bt709:rangein=tv:primaries=bt2020:transfer=arib-std-b67:matrix=bt2020nc:range=tv,format=yuv420p10le",
+                "-c:v", "libx265", "-preset", "ultrafast", "-crf", "18",
+                "-color_primaries", "bt2020", "-color_trc", "arib-std-b67",
+                "-colorspace", "bt2020nc", "-color_range", "tv",
+            ],
+            &hlg,
+        );
+
+        let item = probe_video(&hlg, "hlg-sdr").unwrap();
+        assert_eq!(item.hdr_mode, "hlg");
+        assert_eq!(item.hdr_signal, "hlg");
+        assert_eq!(item.color_range, "tv");
+        assert_eq!(item.bit_depth, 10);
+
+        let mut preset = sdr_target_preset();
+        preset.hardware = "cpu".into();
+        preset.output_mode = "single_folder".into();
+        preset.output_dir = root.join("out").to_string_lossy().to_string();
+        preset.bitrate_mode = "target_mbps".into();
+        preset.target_bitrate_mbps = 8.0;
+        fs::create_dir_all(&preset.output_dir).unwrap();
+        let output = build_output_path(&item, &preset);
+        let encoded = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(build_ffmpeg_args(&item, &preset, &output))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            encoded.status.success(),
+            "HLG→SDR 编码失败：{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+
+        // 直映射贴着 SDR 母版（实测 7%）；老链条会整体压暗约 37%。
+        let master_luma = mean_luma(&master);
+        let converted_luma = mean_luma(&output);
+        let drift = ((converted_luma - master_luma) / master_luma).abs();
+        assert!(
+            drift < 0.12,
+            "HLG→SDR 亮度偏移过大：母版 {master_luma:.1}，输出 {converted_luma:.1}"
+        );
+        assert!(probe_output_stream(&output)["color_transfer"] == "bt709");
+
+        // 同一条素材手动改成 tonemap，必须走软膝链条（亮度明显更低）。
+        let mut forced = preset.clone();
+        forced.tone_map = "tonemap".into();
+        let forced_output = root.join("forced-tonemap.mp4");
+        let encoded = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(build_ffmpeg_args(&item, &forced, &forced_output))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(encoded.status.success(), "强制 tonemap 链条编码失败");
+        let forced_luma = mean_luma(&forced_output);
+        assert!(
+            forced_luma < converted_luma * 0.85,
+            "tonemap 链条应比直映射更暗：{forced_luma:.1} vs {converted_luma:.1}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_flags_unlabelled_wide_gamut_clips_as_suspect_hlg() {
+        let root = std::env::temp_dir().join(format!("vsc-hlg-suspect-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let clip = root.join("unlabelled.mp4");
+        encode_clip(
+            &[
+                "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24", "-t", "0.3",
+                "-c:v", "libx265", "-preset", "ultrafast", "-crf", "20",
+                "-pix_fmt", "yuv420p10le",
+                "-color_primaries", "bt2020", "-colorspace", "bt2020nc",
+                "-color_trc", "unspecified",
+            ],
+            &clip,
+        );
+        let item = probe_video(&clip, "hlg-suspect").unwrap();
+        assert_eq!(item.hdr_mode, "sdr", "未标注的素材不能直接当 HDR 编");
+        assert_eq!(item.hdr_signal, "hlg_suspect");
+        // 这条素材的 VUI 只写了矩阵、没写三原色，宽色域判定必须靠矩阵兜底。
+        assert!(
+            item.color_space.contains("2020"),
+            "色域判定异常：{}",
+            item.color_space
+        );
+        assert_eq!(item.color_matrix, "bt2020nc");
         let _ = fs::remove_dir_all(root);
     }
 

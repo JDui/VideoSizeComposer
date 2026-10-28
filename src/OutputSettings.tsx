@@ -47,7 +47,7 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
           event.preventDefault();
           setActiveTab(tabs[next].id);
           event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
-        }}>{tab.label}{tab.id === "color" && (preset.lutEnabled || !["source", "sdr"].includes(preset.hdrMode)) && <span className="tab-indicator" aria-label="已启用色彩处理" />}</button>)}
+        }}>{tab.label}{tab.id === "color" && (preset.lutEnabled || !["source", "sdr"].includes(preset.hdrMode) || preset.toneMap !== "auto") && <span className="tab-indicator" aria-label="已启用色彩处理" />}</button>)}
     </div>
     {tabs.map((tab) => <div key={tab.id} id={`${uid}-${tab.id}-panel`} className="output-tabpanel" role="tabpanel"
       aria-labelledby={`${uid}-${tab.id}-tab`} hidden={activeTab !== tab.id} tabIndex={0}>
@@ -99,6 +99,8 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
               : { hdrMode, colorSpace: hdrMode === "sdr" ? "rec709" : "source" });
           }}><option value="source">跟随源文件</option><option value="sdr">SDR / Rec.709</option><option value="hlg">HLG / Rec.2100</option><option value="hdr10">HDR10 / PQ</option><option value="dolby_vision">杜比视界（保留源流）</option></select></Field>
           <Field label="色彩空间"><select value={preset.colorSpace} onChange={(event) => onChange({ colorSpace: event.target.value as Preset["colorSpace"] })}><option value="source">跟随源文件</option><option value="rec709">Rec.709</option><option value="rec2020">Rec.2020</option></select></Field>
+          {preset.hdrMode === "sdr" && <Field label="色调映射"><select value={preset.toneMap} onChange={(event) => onChange({ toneMap: event.target.value as Preset["toneMap"] })}><option value="auto">自动（推荐）</option><option value="bt2408">BT.2408 直映射</option><option value="tonemap">软膝压缩高光</option><option value="clip">硬截顶</option></select></Field>}
+          {preset.hdrMode === "sdr" && <small className="field-note">自动：HLG 按源亮度与编码域峰值选择直映射或软膝；PQ / 杜比视界始终压缩高光。</small>}
           <div className="settings-pair"><Field label="色深"><select value={preset.bitDepth} onChange={(event) => onChange({ bitDepth: event.target.value === "source" ? "source" : Number(event.target.value) as 8 | 10 })}><option value="source">跟随源文件</option><option value={8}>8-bit</option><option value={10}>10-bit</option></select></Field>
           <Field label="色度采样"><select value={preset.chroma} onChange={(event) => onChange({ chroma: event.target.value as Preset["chroma"] })}><option value="source">跟随源文件</option><option value="420">4:2:0</option><option value="422">4:2:2</option></select></Field></div>
           {streamCopy && <div className="source-color-note"><ShieldCheck size={15} />仅保留源文件已有的杜比视界，不生成新的元数据。</div>}

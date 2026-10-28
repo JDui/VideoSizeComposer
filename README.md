@@ -32,6 +32,8 @@ VideoSize Composer 是一个便携式桌面批量视频编码器。它使用 Tau
 - 输出封装默认保持源后缀（序列帧默认 MP4），也可选择 MP4、MOV、AVI、MKV、WebM、M4V 或 M4A。
 - 支持 8/10-bit、4:2:0/4:2:2，以及 SDR、HLG 和 HDR10 色彩模式。
 - 通过 FFmpeg `zscale` 完成 HDR/SDR 像素转换并写入匹配的色彩元数据；HDR 转换和 4:2:2 使用 CPU 路径以提高可预测性。
+- HLG→SDR 默认“自动”色调映射：按源亮度元数据与实测编码域峰值，在 BT.2408 直映射（贴近原始 SDR 亮度）和软膝压缩高光之间选择，也可手动固定为直映射、软膝或硬截顶。
+- 未写色彩元数据的宽色域 10-bit 素材标记为「HDR（未标注）」并在任务详情提供「源色彩解释」（自动 / SDR / HLG / HDR10），确认前始终按 SDR 编码，避免误判导致画面变灰或变暗。
 - Dolby Vision 保留模式使用无损 HEVC stream copy 保留已有 RPU；该模式不允许缩放或 LUT 处理，也不会生成新的 Dolby Vision 元数据。
 - 可导入 `.cube`、`.3dl` 和 `.lut` 文件，并将 LUT 与预设一起保存。
 - 识别带全景标签的源视频和 2:1 等距柱状候选；全景输出写入 Google Spherical Video V1 与标准 V2 `st3d`/`sv3d` 元数据，并通过 ffprobe 回读验证。
@@ -115,6 +117,10 @@ pnpm build:mac
 pnpm build
 cd src-tauri
 cargo test
+cd ..
+powershell -ExecutionPolicy Bypass -File .\qa\hlg\verify-hlg.ps1
 ```
 
 Rust 测试覆盖编码器组合、HDR、LUT、全景元数据、导入、重名、临时文件、取消任务，以及创建/修改时间独立恢复等关键路径。
+
+`qa/hlg/verify-hlg.ps1` 用随应用分发的 FFmpeg 复现 HLG 链路并逐项断言：HLG 标签落地、编码域峰值抽样分档、SDR 参考素材的 BT.2408 直映射亮度保持、满量程素材的软膝压缩、`tonemap` 各算法可用性、MDCV/MaxCLL 读取与未标注素材判定，全部通过时退出码为 0。测量结论见 `qa/hlg/verification.md`。
