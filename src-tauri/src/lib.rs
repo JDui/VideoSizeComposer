@@ -3,7 +3,7 @@ use filetime::{set_file_mtime, FileTime};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -11,10 +11,10 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
@@ -430,6 +430,7 @@ pub fn run() {
             probe_sequence_paths,
             start_encode,
             cancel_encode,
+            set_adaptive_concurrency,
             reveal_path
         ])
         .setup(|app| {
@@ -1000,7 +1001,7 @@ fn format_fps(fps: f64) -> String {
 }
 
 #[tauri::command]
-async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<String, String> {
+async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>, adaptive: bool) -> Result<String, String> {
     if jobs.is_empty() {
         return Err("没有可编码的任务".into());
     }
@@ -1018,42 +1019,69 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
         })
         .collect::<Result<Vec<_>, _>>()?;
     let jobs = tauri::async_runtime::spawn_blocking(move || {
-        let mut jobs = jobs;
-        for job in jobs.iter_mut() {
-            prepare_source_peak(job);
-        }
         preflight_jobs(&jobs)?;
         Ok::<_, String>(jobs)
     })
     .await
     .map_err(|error| format!("编码预检查异常：{error}"))??;
     let session_id = Uuid::new_v4().to_string();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let session = Arc::new(EncodeSession {
+        cancel: Arc::new(AtomicBool::new(false)),
+        adaptive: AtomicBool::new(adaptive),
+    });
     encode_sessions()
         .lock()
         .map_err(|_| "无法创建编码会话".to_string())?
-        .insert(session_id.clone(), cancel.clone());
-    let thread_app = app.clone();
+        .insert(session_id.clone(), session.clone());
     let thread_session_id = session_id.clone();
     thread::spawn(move || {
-        for job in jobs {
-            if cancel.load(Ordering::Relaxed) {
-                emit_cancelled(&thread_app, job.item.id);
-                continue;
+        let mut pending: VecDeque<EncodeJob> = jobs.into();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mut running = 0usize;
+        let mut heavy_running = false;
+        loop {
+            if session.cancel.load(Ordering::Relaxed) {
+                for job in pending.drain(..) {
+                    emit_cancelled(&app, job.item.id);
+                }
             }
-            if let Err((item_id, message)) = encode_job(&thread_app, job, &cancel) {
-                let _ = thread_app.emit(
-                    "encode-progress",
-                    EncodeProgress {
-                        item_id,
-                        progress: 0,
-                        status: "失败".into(),
-                        output: None,
-                        ok: Some(false),
-                        message: Some(message),
-                        alpha_output: None,
-                    },
-                );
+            let limit = if session.adaptive.load(Ordering::Relaxed) {
+                adaptive_limit(running)
+            } else { 1 };
+            while running < limit && !session.cancel.load(Ordering::Relaxed) {
+                if !session.adaptive.load(Ordering::Relaxed) && running >= 1 { break; }
+                let Some(next) = pending.front() else { break };
+                let heavy = is_heavy_job(next);
+                if !can_start_job(running, limit, heavy_running, heavy) { break; }
+                let job = pending.pop_front().expect("pending job exists");
+                let worker_app = app.clone();
+                let worker_session = session.clone();
+                let tx = finished_tx.clone();
+                running += 1;
+                heavy_running |= heavy;
+                thread::spawn(move || {
+                    let item_id = job.item.id.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                        encode_job(&worker_app, job, &worker_session.cancel)
+                    ));
+                    let failure = match result {
+                        Ok(Err((id, message))) => Some((id, message)),
+                        Err(_) => Some((item_id, "编码任务异常退出".into())),
+                        _ => None,
+                    };
+                    if let Some((item_id, message)) = failure {
+                        let _ = worker_app.emit("encode-progress", EncodeProgress {
+                            item_id, progress: 0, status: "失败".into(), output: None,
+                            ok: Some(false), message: Some(message), alpha_output: None,
+                        });
+                    }
+                    let _ = tx.send(heavy);
+                });
+            }
+            if pending.is_empty() && running == 0 { break; }
+            if let Ok(heavy) = finished_rx.recv_timeout(Duration::from_millis(500)) {
+                running -= 1;
+                if heavy { heavy_running = false; }
             }
         }
         if let Ok(mut sessions) = encode_sessions().lock() {
@@ -1065,7 +1093,7 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>) -> Result<Str
 
 /// `build_ffmpeg_args` 必须保持纯函数（单元测试直接调用它），所以高光映射策略要用的
 /// 编码域峰值在这里抽样一次写回 item；只在「HDR→SDR 且策略为 auto」时才解码。
-fn prepare_source_peak(job: &mut EncodeJob) {
+fn prepare_source_peak(job: &mut EncodeJob, cancel: &AtomicBool) {
     job.item.coded_peak_ratio = 0.0;
     if job.preset.hdr_mode != "sdr" || !matches!(job.preset.tone_map.as_str(), "" | "auto") {
         return;
@@ -1074,12 +1102,20 @@ fn prepare_source_peak(job: &mut EncodeJob) {
     if src.hdr_mode != "hlg" {
         return;
     }
+    if job.item.peak_luminance >= 600.0 || job.item.max_cll >= 300 {
+        return;
+    }
     if let Some(ratio) = sample_coded_peak_ratio(
         Path::new(&job.item.source),
         job.item.bit_depth,
         src.range == "pc",
+        job.item.duration,
+        cancel,
     ) {
         job.item.coded_peak_ratio = ratio;
+    } else {
+        // A failed or incomplete sample must not be mistaken for a low peak.
+        job.item.coded_peak_ratio = 1.0;
     }
 }
 
@@ -1445,22 +1481,98 @@ fn estimated_output_fps(item: &QueueItem, preset: &Preset) -> f64 {
         .unwrap_or(30.0)
 }
 
+struct EncodeSession {
+    cancel: Arc<AtomicBool>,
+    adaptive: AtomicBool,
+}
+
 #[tauri::command]
 fn cancel_encode(session_id: String) -> Result<(), String> {
-    let sessions = encode_sessions()
-        .lock()
-        .map_err(|_| "无法访问编码会话".to_string())?;
-    let cancel = sessions
-        .get(&session_id)
-        .ok_or_else(|| "编码会话已结束或不存在".to_string())?;
-    cancel.store(true, Ordering::Relaxed);
+    let sessions = encode_sessions().lock().map_err(|_| "无法访问编码会话".to_string())?;
+    let session = sessions.get(&session_id).ok_or_else(|| "编码会话已结束或不存在".to_string())?;
+    session.cancel.store(true, Ordering::Relaxed);
     Ok(())
 }
 
-fn encode_sessions() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+#[tauri::command]
+fn set_adaptive_concurrency(session_id: String, enabled: bool) -> Result<(), String> {
+    let sessions = encode_sessions().lock().map_err(|_| "无法访问编码会话".to_string())?;
+    let session = sessions.get(&session_id).ok_or_else(|| "编码会话已结束或不存在".to_string())?;
+    session.adaptive.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
+fn encode_sessions() -> &'static Mutex<HashMap<String, Arc<EncodeSession>>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<EncodeSession>>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+fn can_start_job(running: usize, limit: usize, heavy_running: bool, next_heavy: bool) -> bool {
+    running < limit && !heavy_running && (!next_heavy || running == 0)
+}
+
+// Keep high-resolution frame pipelines exclusive: each can require hundreds of MiB per frame.
+fn is_heavy_job(job: &EncodeJob) -> bool {
+    let (w, h) = estimated_output_dimensions(&job.item, &job.preset);
+    let source = u64::from(job.item.width) * u64::from(job.item.height);
+    source.max(w * h) >= LARGE_FRAME_PIXEL_THRESHOLD || is_insv(Path::new(&job.item.source))
+}
+
+fn adaptive_limit_for(cores: usize, available_bytes: Option<u64>, running: usize) -> usize {
+    let cpu_limit = (cores / 4).clamp(1, 4);
+    // Available memory already excludes running workers. Reserve 2 GiB for the system,
+    // then require another 2 GiB per new worker; never interrupt existing workers.
+    let additional = available_bytes.map(|bytes| bytes.saturating_sub(2 * 1024_u64.pow(3)) / (2 * 1024_u64.pow(3))).unwrap_or(0) as usize;
+    cpu_limit.min(running.saturating_add(additional)).max(1)
+}
+
+fn adaptive_limit(running: usize) -> usize {
+    // The scheduler recalculates while running. The additional-memory allowance
+    // is converted to a total by counting active workers at the call site below.
+    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    adaptive_limit_for(cores, available_memory(), running)
+}
+
+#[cfg(windows)]
+fn available_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { Some(status.ullAvailPhys) } else { None }
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|line| line.starts_with("MemAvailable:"))?;
+    line.split_whitespace().nth(1)?.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+#[cfg(target_os = "macos")]
+fn available_memory() -> Option<u64> {
+    // Reclaimable pages are sampled at most once every three seconds.
+    static SAMPLE: OnceLock<Mutex<Option<(std::time::Instant, Option<u64>)>>> = OnceLock::new();
+    let mut sample = SAMPLE.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if let Some((at, value)) = *sample {
+        if at.elapsed() < Duration::from_secs(3) { return value; }
+    }
+    let value = (|| {
+        let output = Command::new("vm_stat").output().ok()?;
+        if !output.status.success() { return None; }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let page_size = text.lines().next()?.split("page size of ").nth(1)?
+            .split_whitespace().next()?.parse::<u64>().ok()?;
+        let pages: u64 = text.lines().filter(|line|
+            line.starts_with("Pages free:") || line.starts_with("Pages inactive:") || line.starts_with("Pages speculative:")
+        ).filter_map(|line| line.split(':').nth(1)?.trim().trim_end_matches('.').parse::<u64>().ok()).sum();
+        pages.checked_mul(page_size)
+    })();
+    *sample = Some((std::time::Instant::now(), value));
+    value
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn available_memory() -> Option<u64> { None }
 
 fn emit_cancelled(app: &tauri::AppHandle, item_id: String) {
     let _ = app.emit(
@@ -2420,18 +2532,24 @@ impl Drop for TemporaryFileGuard {
 
 fn encode_job(
     app: &tauri::AppHandle,
-    job: EncodeJob,
+    mut job: EncodeJob,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), (String, String)> {
     let item_id = job.item.id.clone();
+    if cancel.load(Ordering::Relaxed) {
+        emit_cancelled(app, item_id);
+        return Ok(());
+    }
     let source = PathBuf::from(&job.item.source);
-    let output = unique_output_path(&build_output_path(&job.item, &job.preset));
+    let output_guard = ReservedOutput::new(&build_output_path(&job.item, &job.preset));
+    let output = output_guard.0.clone();
+    let alpha_guard = job.item.export_alpha_mask.then(|| ReservedOutput::new(&alpha_output_base(&output)));
     let temporary_output = temporary_output_path(&output);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|error| (item_id.clone(), error.to_string()))?;
     }
 
-    let stitched = if is_insv(&source)
+    let mut stitched = if is_insv(&source)
         && !matches!(
             output_extension(&job.item, &job.preset).as_str(),
             "m4a" | "wav"
@@ -2447,6 +2565,19 @@ fn encode_job(
     } else {
         None
     };
+    if let Some(prepared) = stitched.as_mut() {
+        let mut sample_job = EncodeJob { item: prepared.item.clone(), preset: job.preset.clone() };
+        prepare_source_peak(&mut sample_job, cancel);
+        prepared.item.coded_peak_ratio = sample_job.item.coded_peak_ratio;
+        job.item.coded_peak_ratio = sample_job.item.coded_peak_ratio;
+    } else {
+        prepare_source_peak(&mut job, cancel);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        emit_cancelled(app, item_id);
+        return Ok(());
+    }
+    validate_job(&job).map_err(|error| (item_id.clone(), error))?;
     let encoding_item = stitched
         .as_ref()
         .map(|prepared| &prepared.item)
@@ -2581,7 +2712,7 @@ fn encode_job(
     }
 
     let alpha_output = if job.item.export_alpha_mask {
-        let alpha_output = build_alpha_output_path(&output);
+        let alpha_output = alpha_guard.as_ref().expect("alpha path reserved").0.clone();
         let alpha_temporary = temporary_output_path(&alpha_output);
         let alpha_args = build_alpha_ffmpeg_args_with_sequence(
             encoding_item,
@@ -2858,7 +2989,7 @@ fn append_output_fps(args: &mut Vec<String>, preset: &Preset) {
     }
 }
 
-fn build_alpha_output_path(main_output: &Path) -> PathBuf {
+fn alpha_output_base(main_output: &Path) -> PathBuf {
     let parent = main_output.parent().unwrap_or_else(|| Path::new("."));
     let stem = main_output
         .file_stem()
@@ -2868,7 +2999,11 @@ fn build_alpha_output_path(main_output: &Path) -> PathBuf {
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("mp4");
-    unique_output_path(&parent.join(format!("{stem}_alpha.{extension}")))
+    parent.join(format!("{stem}_alpha.{extension}"))
+}
+
+fn build_alpha_output_path(main_output: &Path) -> PathBuf {
+    unique_output_path(&alpha_output_base(main_output))
 }
 
 fn is_isobmff_path(path: &Path) -> bool {
@@ -2925,6 +3060,41 @@ fn append_frame_memory_safety_args(args: &mut Vec<String>, item: &QueueItem, pre
             "-threads".into(),
             "2".into(),
         ]);
+    }
+}
+
+fn reservation_key(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let full = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+        .join(path.file_name().unwrap_or_default());
+    if cfg!(windows) { PathBuf::from(full.to_string_lossy().to_lowercase()) } else { full }
+}
+
+fn reserved_outputs() -> &'static Mutex<HashSet<PathBuf>> {
+    static RESERVED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    RESERVED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ReservedOutput(PathBuf);
+impl ReservedOutput {
+    fn new(base: &Path) -> Self {
+        let mut reserved = reserved_outputs().lock().unwrap_or_else(|e| e.into_inner());
+        let parent = base.parent().unwrap_or_else(|| Path::new("."));
+        let stem = base.file_stem().and_then(|v| v.to_str()).unwrap_or("output");
+        let ext = base.extension().and_then(|v| v.to_str()).unwrap_or("mp4");
+        let mut candidate = base.to_path_buf();
+        let mut index = 1usize;
+        while candidate.exists() || reserved.contains(&reservation_key(&candidate)) {
+            candidate = parent.join(format!("{stem}-{index}.{ext}"));
+            index += 1;
+        }
+        reserved.insert(reservation_key(&candidate));
+        Self(candidate)
+    }
+}
+impl Drop for ReservedOutput {
+    fn drop(&mut self) {
+        reserved_outputs().lock().unwrap_or_else(|e| e.into_inner()).remove(&reservation_key(&self.0));
     }
 }
 
@@ -3399,6 +3569,13 @@ fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
 
 fn video_filter_with_exe_dir(item: &QueueItem, preset: &Preset, exe_dir: &Path) -> Option<String> {
     let mut filters = Vec::new();
+    if matches!(item.source_color_override.as_str(), "sdr" | "hlg" | "hdr10") {
+        let color = source_color(item);
+        filters.push(format!(
+            "setparams=range={}:color_primaries={}:color_trc={}:colorspace={}",
+            color.range, color.primaries, color.transfer, color.matrix
+        ));
+    }
     if item.media_kind == "sequence" {
         filters.push(format!("setpts=N/({:.6}*TB)", item.sequence_fps.max(0.001)));
         filters.push(format!(
@@ -3511,6 +3688,15 @@ fn effective_hdr_mode(item: &QueueItem) -> &'static str {
 }
 
 fn source_color(item: &QueueItem) -> SourceColor {
+    if item.source_color_override == "sdr" {
+        return SourceColor {
+            primaries: "bt709",
+            transfer: "bt709",
+            matrix: "bt709",
+            range: normalized_range(&item.color_range),
+            hdr_mode: "sdr",
+        };
+    }
     let hdr_mode = effective_hdr_mode(item);
     let transfer = match hdr_mode {
         "hlg" => "arib-std-b67",
@@ -3663,7 +3849,11 @@ fn add_color_output_args(args: &mut Vec<String>, item: &QueueItem, preset: &Pres
         "-colorspace".into(),
         matrix.into(),
         "-color_range".into(),
-        "tv".into(),
+        if color_conversion_filter(item, preset).is_some() {
+            "tv".into()
+        } else {
+            source_color(item).range.into()
+        },
     ]);
     if preset.hdr_mode == "hdr10" && encoder == "libx265" {
         // 优先沿用源素材自带的母版显示元数据与 MaxCLL，没有才回落到 BT.2020 默认值。
@@ -4570,37 +4760,48 @@ fn max_signalstat(output: &[u8], key: &str) -> Option<f64> {
         })
 }
 
-/// HLG 是场景参考信号：手机/调色台出来的“HLG”峰值常只到码值 0.6 左右，广电 HLG 会打到
-/// 1.0，两者需要的高光映射完全不同（实测直映射在后者的 Ymax 会冲到 255）。编码域峰值
-/// 是唯一能区分它们的实测依据，用只解关键帧的方式抽样，避免整片解码。
-fn sample_coded_peak_ratio(path: &Path, bit_depth: u32, full_range: bool) -> Option<f64> {
+/// 抽取最多五个关键帧；无法完成抽样时由调用方保守地压缩高光。
+fn sample_coded_peak_ratio(path: &Path, bit_depth: u32, full_range: bool, duration: f64, cancel: &AtomicBool) -> Option<f64> {
     if !filter_available("signalstats") {
         return None;
     }
-    let mut command = command_with_hidden_window(resolve_tool("ffmpeg"));
-    command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "info",
-            "-skip_frame",
-            "nokey",
-            "-i",
-        ])
-        .arg(path)
-        .args([
-            "-map",
-            "0:v:0",
-            "-an",
-            "-vf",
-            "signalstats,metadata=print",
-            "-f",
-            "null",
-            "-",
-        ]);
-    let output = command.output().ok()?;
-    let ymax = max_signalstat(&output.stderr, "YMAX")?;
-    Some(coded_peak_ratio(ymax, bit_depth, full_range))
+    let positions: &[f64] = if duration.is_finite() && duration > 0.0 {
+        &[0.0, 0.25, 0.5, 0.75, 0.95]
+    } else {
+        return None;
+    };
+    let mut peak: f64 = 0.0;
+    for fraction in positions {
+        if cancel.load(Ordering::Relaxed) { return None; }
+        let seek = format!("{:.3}", duration * fraction);
+        let mut child = command_with_hidden_window(resolve_tool("ffmpeg"))
+            .args(["-hide_banner", "-loglevel", "info", "-ss", &seek, "-noaccurate_seek", "-skip_frame", "nokey", "-i"])
+            .arg(path)
+            .args(["-map", "0:v:0", "-an", "-frames:v", "1", "-vf", "signalstats,metadata=print", "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn().ok()?;
+        let started = Instant::now();
+        loop {
+            if cancel.load(Ordering::Relaxed) || started.elapsed() >= Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => { let _ = child.kill(); let _ = child.wait(); return None; }
+            }
+        }
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() { return None; }
+        let ymax = max_signalstat(&output.stderr, "YMAX")?;
+        peak = peak.max(coded_peak_ratio(ymax, bit_depth, full_range));
+        if peak >= 0.80 { break; }
+    }
+    Some(peak)
 }
 
 fn detect_hdr_mode(video: &Value) -> String {
@@ -6031,11 +6232,46 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_serial_drains_running_jobs_before_starting_next() {
+        assert!(can_start_job(1, 4, false, false));
+        assert!(!can_start_job(3, 1, false, false));
+        assert!(!can_start_job(1, 1, false, false));
+        assert!(can_start_job(0, 1, false, false));
+        assert!(!can_start_job(1, 4, false, true));
+        assert!(!can_start_job(1, 4, true, false));
+        assert!(can_start_job(0, 4, false, true));
+    }
+
+    #[test]
+    fn adaptive_capacity_obeys_resources_and_running_workers() {
+        let gib = 1024_u64.pow(3);
+        assert_eq!(adaptive_limit_for(16, Some(10 * gib), 0), 4);
+        assert_eq!(adaptive_limit_for(8, Some(10 * gib), 0), 2);
+        assert_eq!(adaptive_limit_for(16, Some(3 * gib), 2), 2);
+        assert_eq!(adaptive_limit_for(16, None, 0), 1);
+        assert_eq!(adaptive_limit_for(16, Some(4 * gib), 2), 3);
+    }
+
+    #[test]
+    fn simultaneous_output_reservations_are_distinct_and_released() {
+        let root = std::env::temp_dir();
+        let stem = format!("vsc-reserve-{}", Uuid::new_v4());
+        let base = root.join(format!("{stem}.mp4"));
+        let first = ReservedOutput::new(&base);
+        let second = ReservedOutput::new(&base);
+        assert_eq!(first.0, base);
+        assert_eq!(second.0, root.join(format!("{stem}-1.mp4")));
+        drop(first);
+        assert_eq!(ReservedOutput::new(&base).0, base);
+        drop(second);
+    }
+
+    #[test]
     fn cancel_encode_marks_only_the_requested_session() {
         let requested_id = format!("cancel-test-{}", Uuid::new_v4());
         let other_id = format!("cancel-test-{}", Uuid::new_v4());
-        let requested = Arc::new(AtomicBool::new(false));
-        let other = Arc::new(AtomicBool::new(false));
+        let requested = Arc::new(EncodeSession { cancel: Arc::new(AtomicBool::new(false)), adaptive: AtomicBool::new(false) });
+        let other = Arc::new(EncodeSession { cancel: Arc::new(AtomicBool::new(false)), adaptive: AtomicBool::new(false) });
         {
             let mut sessions = encode_sessions().lock().unwrap();
             sessions.insert(requested_id.clone(), requested.clone());
@@ -6044,8 +6280,8 @@ mod tests {
 
         cancel_encode(requested_id.clone()).unwrap();
 
-        assert!(requested.load(Ordering::Relaxed));
-        assert!(!other.load(Ordering::Relaxed));
+        assert!(requested.cancel.load(Ordering::Relaxed));
+        assert!(!other.cancel.load(Ordering::Relaxed));
         let mut sessions = encode_sessions().lock().unwrap();
         sessions.remove(&requested_id);
         sessions.remove(&other_id);
@@ -6859,6 +7095,30 @@ mod tests {
     }
 
     #[test]
+    fn manual_sdr_override_and_full_range_follow_source() {
+        let mut item = hlg_item();
+        item.color_range = "pc".into();
+        item.source_color_override = "sdr".into();
+        let source = source_color(&item);
+        assert_eq!((source.primaries, source.transfer, source.matrix, source.range),
+            ("bt709", "bt709", "bt709", "pc"));
+        let mut follow = preset_with_defaults("follow", "Follow", "h265", "_follow");
+        follow.hardware = "cpu".into();
+        let args = build_ffmpeg_args(&item, &follow, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range pc"));
+        assert!(args.contains("setparams=range=pc:color_primaries=bt709:color_trc=bt709:colorspace=bt709"));
+        assert!(color_conversion_filter(&item, &follow).is_none());
+
+        item.source_color_override.clear();
+        let args = build_ffmpeg_args(&item, &follow, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-color_trc arib-std-b67"));
+        assert!(args.contains("-color_range pc"));
+        let args = build_ffmpeg_args(&item, &sdr_target_preset(), Path::new("out.mp4")).join(" ");
+        assert!(args.contains("rangein=pc"));
+        assert!(args.contains("-color_range tv"));
+    }
+
+    #[test]
     fn keeping_an_hdr_source_refuses_lossy_targets() {
         let item = hlg_item();
         let mut follow = preset_with_defaults("follow", "跟随源文件", "h264", "_follow");
@@ -6953,6 +7213,12 @@ mod tests {
         assert_eq!(item.hdr_signal, "hlg");
         assert_eq!(item.color_range, "tv");
         assert_eq!(item.bit_depth, 10);
+        let cancel = AtomicBool::new(false);
+        let sampled = sample_coded_peak_ratio(&hlg, item.bit_depth, false, item.duration, &cancel)
+            .expect("HLG 关键帧抽样应成功");
+        assert!(sampled > 0.0 && sampled < 1.1, "抽样峰值异常：{sampled}");
+        cancel.store(true, Ordering::Relaxed);
+        assert!(sample_coded_peak_ratio(&hlg, item.bit_depth, false, item.duration, &cancel).is_none());
 
         let mut preset = sdr_target_preset();
         preset.hardware = "cpu".into();

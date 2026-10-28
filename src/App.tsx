@@ -56,6 +56,7 @@ import {
   revealPath,
   savePreset,
   savePreferences,
+  setAdaptiveConcurrency,
   startEncode
 } from "./tauri";
 import type { AppPreferences, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, SourceColorChoice, ToolStatus } from "./types";
@@ -137,6 +138,10 @@ export default function App() {
   useEffect(() => {
     applyTheme(settingsOpen ? preferencesDraft.theme : preferences.theme);
   }, [settingsOpen, preferencesDraft.theme, preferences.theme]);
+  const [adaptiveConcurrency, setAdaptiveConcurrencyState] = useState(false);
+  const adaptiveConcurrencyRef = useRef(false);
+  const activeSessionRef = useRef("");
+  const adaptiveUpdateRef = useRef<Promise<void>>(Promise.resolve());
   const [encodingIds, setEncodingIds] = useState<string[]>([]);
   const [isImporting, setIsImporting] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -288,7 +293,10 @@ export default function App() {
   }, [notice]);
 
   useEffect(() => {
-    if (!isEncoding) setActiveSessionId("");
+    if (!isEncoding) {
+      setActiveSessionId("");
+      activeSessionRef.current = "";
+    }
   }, [isEncoding]);
 
   useEffect(() => {
@@ -677,7 +685,10 @@ export default function App() {
         : item))
     );
     try {
-      const session = await startEncode(jobs);
+      // Start serially so a switch changed during preflight cannot launch stale parallel work.
+      const session = await startEncode(jobs, false);
+      activeSessionRef.current = session;
+      if (adaptiveConcurrencyRef.current) syncAdaptiveConcurrency(session);
       setActiveSessionId(session);
       setLog((lines) => [`编码会话已启动 · ${session}`, ...lines].slice(0, 120));
       if (!isTauriRuntime) simulateEncode(jobs.map((job) => job.item.id));
@@ -692,32 +703,57 @@ export default function App() {
   }
 
   function simulateEncode(ids: string[]) {
-    let progress = 0;
+    const progressById = new Map(ids.map((id) => [id, 0]));
     simulationTimer.current = window.setInterval(() => {
-      progress = Math.min(100, progress + 8);
+      const running = ids.filter((id) => (progressById.get(id) ?? 0) > 0 && (progressById.get(id) ?? 0) < 100);
+      const limit = adaptiveConcurrencyRef.current ? Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 1) / 4))) : 1;
+      const selected = [...running];
+      for (const id of ids) {
+        if (selected.length >= limit) break;
+        if (progressById.get(id) === 0) selected.push(id);
+      }
+      selected.forEach((id) => progressById.set(id, Math.min(100, (progressById.get(id) ?? 0) + 8)));
       setQueue((items) =>
         items.map((item) =>
-          ids.includes(item.id)
+          selected.includes(item.id)
             ? {
                 ...item,
-                progress,
-                status: progress >= 100
+                progress: progressById.get(item.id) ?? 0,
+                status: (progressById.get(item.id) ?? 0) >= 100
                   ? activePreset?.keepTimes ? "完成 · 已保留原始时间" : "完成"
-                  : `编码中 ${progress}%`,
-                alphaOutput: progress >= 100 && item.exportAlphaMask && item.hasAlpha
+                  : `编码中 ${progressById.get(item.id)}%`,
+                alphaOutput: (progressById.get(item.id) ?? 0) >= 100 && item.exportAlphaMask && item.hasAlpha
                   ? previewAlphaOutput(item.output || previewOutput(item, activePreset ?? normalizePreset({})))
                   : item.alphaOutput
               }
             : item
         )
       );
-      if (progress >= 100) {
+      setEncodingIds(ids.filter((id) => (progressById.get(id) ?? 0) < 100));
+      if (ids.every((id) => progressById.get(id) === 100)) {
         if (simulationTimer.current !== null) window.clearInterval(simulationTimer.current);
         simulationTimer.current = null;
         setEncodingIds([]);
         setLog((lines) => [`全部 ${ids.length} 个视频处理完成`, ...lines].slice(0, 120));
       }
     }, 260);
+  }
+
+  function syncAdaptiveConcurrency(session: string) {
+    // Serialize updates so rapid clicks cannot leave the backend in an older state.
+    adaptiveUpdateRef.current = adaptiveUpdateRef.current.then(async () => {
+      if (activeSessionRef.current !== session) return;
+      await setAdaptiveConcurrency(session, adaptiveConcurrencyRef.current);
+    }).catch((error) => {
+      setLog((lines) => [`并发设置更新：${String(error)}`, ...lines].slice(0, 120));
+    });
+  }
+
+  function toggleAdaptiveConcurrency() {
+    const enabled = !adaptiveConcurrencyRef.current;
+    adaptiveConcurrencyRef.current = enabled;
+    setAdaptiveConcurrencyState(enabled);
+    if (activeSessionRef.current) syncAdaptiveConcurrency(activeSessionRef.current);
   }
 
   async function cancelCurrentEncoding() {
@@ -864,6 +900,7 @@ export default function App() {
           <strong>VideoSize Composer <span className="brand-version">{functionVersion}</span></strong>
         </div>
         <div className="titlebar-actions">
+          <button className={`adaptive-toggle ${adaptiveConcurrency ? "is-on" : ""}`} role="switch" aria-checked={adaptiveConcurrency} aria-label="自适应并发" title={adaptiveConcurrency ? "自适应并发已开启，按硬件资源调度" : "自适应并发已关闭，任务依次执行"} onClick={toggleAdaptiveConcurrency}><span>自适应并发</span><span className="adaptive-toggle-track" aria-hidden="true"><span /></span></button>
           <button className="text-icon-button" onClick={() => { setPreferencesDraft(preferences); setSettingsOpen(true); }}><Settings size={17} />设置</button>
           <button className="text-icon-button" onClick={() => setHelpOpen(true)}><HelpCircle size={17} />帮助</button>
         </div>
@@ -1180,7 +1217,7 @@ function MediaInfoModal({ item, presetName, outputPath, onClose, onTogglePanoram
       <InfoField label="量化范围" value={item.mediaKind === "audio" ? "不适用" : item.colorRange === "pc" ? "pc（全范围）" : item.colorRange === "tv" ? "tv（有限范围）" : "未标注，按 tv 处理"} />
       <InfoField label="母版峰值" value={item.peakLuminance && item.peakLuminance > 0 ? `${Math.round(item.peakLuminance)} cd/m²` : "未携带 MDCV"} />
       <InfoField label="MaxCLL / MaxFALL" value={item.maxCll && item.maxCll > 0 ? `${item.maxCll} / ${item.maxFall ?? 0} cd/m²` : "未携带"} />
-      <InfoField label="编码域峰值" value={item.mediaKind === "audio" ? "不适用" : item.codedPeakRatio && item.codedPeakRatio > 0 ? `${Math.round(item.codedPeakRatio * 100)}% 满量程` : "未抽样"} />
+      <InfoField label="编码域峰值" value={item.mediaKind === "audio" ? "不适用" : "编码时可能抽样，不在此显示"} />
       <InfoField label="Alpha 通道" value={item.hasAlpha ? "有" : "无"} />
       <InfoField label="音轨 / 字幕" value={tracks} />
       <InfoField label="全景状态" value={item.isPanorama ? "全景视频" : "非全景视频"} />

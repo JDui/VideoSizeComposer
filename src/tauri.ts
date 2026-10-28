@@ -153,9 +153,14 @@ export async function probeSequencePaths(paths: string[], presetId: string, defa
   return invoke("probe_sequence_paths", { paths, presetId, defaultFps });
 }
 
-export async function startEncode(jobs: EncodeJob[]): Promise<string> {
+export async function startEncode(jobs: EncodeJob[], adaptive: boolean): Promise<string> {
   if (!isTauriRuntime) return `demo-session-${jobs.length}`;
-  return invoke("start_encode", { jobs });
+  return invoke("start_encode", { jobs, adaptive });
+}
+
+export async function setAdaptiveConcurrency(sessionId: string, enabled: boolean): Promise<void> {
+  if (!isTauriRuntime) return;
+  return invoke("set_adaptive_concurrency", { sessionId, enabled });
 }
 
 export async function cancelEncode(sessionId: string): Promise<void> {

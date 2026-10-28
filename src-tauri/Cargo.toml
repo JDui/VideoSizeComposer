@@ -1,6 +1,6 @@
 [package]
 name = "videosize-composer"
-version = "2026.8.3"
+version = "2026.9.1"
 description = "Cross-platform video compression tool"
 authors = ["VideoSize Composer"]
 edition = "2021"
@@ -28,7 +28,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

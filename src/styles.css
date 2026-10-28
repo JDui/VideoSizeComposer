@@ -66,7 +66,14 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .brand-lockup strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 680; }
 .brand-version { color: var(--muted); font-size: .78em; font-weight: 560; letter-spacing: .02em; }
 .brand-mark { display: block; width: 28px; height: 28px; flex: 0 0 28px; object-fit: contain; border-radius: 7px; }
-.titlebar-actions { display: flex; gap: 6px; }
+.titlebar-actions { display: flex; align-items: center; gap: 6px; }
+.adaptive-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 4px 9px 4px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--muted); cursor: pointer; font-size: 12px; white-space: nowrap; }
+.adaptive-toggle:hover { color: var(--text); border-color: var(--accent); }
+.adaptive-toggle.is-on { color: var(--text); background: var(--accent-soft); border-color: var(--accent); }
+.adaptive-toggle-track { width: 28px; height: 16px; border-radius: 999px; background: var(--subtle); padding: 2px; transition: background .16s ease; }
+.adaptive-toggle-track > span { display: block; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); transition: transform .16s ease; }
+.adaptive-toggle.is-on .adaptive-toggle-track { background: var(--accent); }
+.adaptive-toggle.is-on .adaptive-toggle-track > span { transform: translateX(12px); background: var(--accent-ink); }
 
 .text-icon-button, .quiet-action, .icon-only, .secondary-button, .review-button, .row-disclosure {
   border: 0;
