@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import editorDemoFrame from "../assets/editor-demo-frame.jpg";
 import { defaultTheme, normalizeTheme } from "./theme";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AppPreferences, EncodeJob, EncodeProgress, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
+import type { AppPreferences, EncodeJob, EncodeProgress, Insta360SdkStatus, PlatformInfo, Preset, QueueItem, ToolStatus } from "./types";
 
 export const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const browserPresetsKey = "videosize-composer.presets.v1";
@@ -35,6 +36,26 @@ export async function getToolStatus(): Promise<ToolStatus> {
     };
   }
   return invoke("get_tool_status");
+}
+
+export async function detectInsta360Sdk(configuredPath: string): Promise<Insta360SdkStatus> {
+  if (!isTauriRuntime) return { state: "missing", path: null, message: "浏览器演示无法扫描 SDK，请在桌面程序中检测。" };
+  return invoke("detect_insta360_sdk", { configuredPath });
+}
+
+export async function setupInsta360Sdk(configuredPath: string, downloadUrl?: string): Promise<Insta360SdkStatus> {
+  if (!isTauriRuntime) return { state: "missing", path: null, message: "浏览器演示无法扫描或下载 SDK，请在桌面程序中使用此功能。" };
+  return invoke("setup_insta360_sdk", { configuredPath, downloadUrl: downloadUrl || null });
+}
+
+export function onInsta360SdkProgress(handler: (message: string) => void) {
+  if (!isTauriRuntime) return Promise.resolve(() => undefined);
+  return listen<string>("insta360-sdk-progress", (event) => handler(event.payload));
+}
+
+export async function openInsta360SdkDownload(): Promise<void> {
+  if (!isTauriRuntime) { window.open("https://www.insta360.com/sdk/record", "_blank", "noopener,noreferrer"); return; }
+  await invoke("open_insta360_sdk_download");
 }
 
 export async function loadPresets(): Promise<Preset[]> {
@@ -156,6 +177,12 @@ export async function probeSequencePaths(paths: string[], presetId: string, defa
 export async function startEncode(jobs: EncodeJob[], adaptive: boolean): Promise<string> {
   if (!isTauriRuntime) return `demo-session-${jobs.length}`;
   return invoke("start_encode", { jobs, adaptive });
+}
+
+/** Render a real frame with the same editing filters used for encoding. */
+export async function previewMediaEdit(item: QueueItem, preset: Preset, atSeconds: number, compareOriginal = false): Promise<string> {
+  if (!isTauriRuntime) throw new Error("本地媒体静帧预览请在桌面版中使用。");
+  return invoke("preview_media_edit", { item, preset, atSeconds, compareOriginal });
 }
 
 export async function setAdaptiveConcurrency(sessionId: string, enabled: boolean): Promise<void> {
@@ -341,6 +368,7 @@ function demoQueue(presetId: string): QueueItem[] {
 
   return rows.map((row, index) => ({
     id: `demo-${index}`,
+    thumbnail: index === 0 ? editorDemoFrame : undefined,
     source: `D:/Media/${row.fileName}`,
     selected: true,
     presetId,

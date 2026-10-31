@@ -149,7 +149,7 @@ pub(super) fn describe_insv(item: &mut QueueItem, json: &Value) -> Result<(), St
     Ok(())
 }
 
-fn sdk_in_directory(path: &Path) -> Option<PathBuf> {
+pub(super) fn sdk_in_directory(path: &Path) -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "MediaSDKTest.exe"
     } else {
@@ -176,6 +176,12 @@ pub(super) fn resolve_sdk() -> Option<PathBuf> {
         .flatten()
         .map(|p| p.insta360_sdk_path)
         .unwrap_or_default();
+    resolve_sdk_path(&configured)
+}
+
+pub(super) fn resolve_sdk_path(configured: &str) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") { return None; }
+    let exe_dir = executable_dir_path().ok()?;
     if !configured.trim().is_empty() {
         // An explicitly configured but invalid directory must not use a different SDK.
         return sdk_in_directory(Path::new(configured.trim()));
@@ -184,6 +190,7 @@ pub(super) fn resolve_sdk() -> Option<PathBuf> {
         return sdk_in_directory(Path::new(&root));
     }
     sdk_in_directory(&exe_dir.join("insta360"))
+        .or_else(|| super::sdk_setup::managed_sdk(&exe_dir))
         .or_else(|| sdk_in_directory(&exe_dir))
         .or_else(|| {
             std::env::var_os("PATH")
@@ -199,7 +206,7 @@ fn missing_sdk() -> String {
 }
 
 pub(super) fn validate_insv_job(item: &QueueItem, preset: &Preset) -> Result<(), String> {
-    if matches!(output_extension(item, preset).as_str(), "m4a" | "wav") {
+    if matches!(output_extension(item, preset).as_str(), "m4a" | "wav" | "mp3") {
         return Ok(());
     }
     if preset.hdr_mode == "dolby_vision" {
@@ -300,7 +307,7 @@ fn validate_sdk(sdk: &Path, item: &QueueItem, preset: &Preset) -> Result<(), Str
 
 pub(super) fn intermediate_bytes(item: &QueueItem, preset: &Preset) -> u64 {
     if !is_insv(Path::new(&item.source))
-        || matches!(output_extension(item, preset).as_str(), "m4a" | "wav")
+        || matches!(output_extension(item, preset).as_str(), "m4a" | "wav" | "mp3")
     {
         return 0;
     }

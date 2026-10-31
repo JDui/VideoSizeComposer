@@ -11,6 +11,9 @@ type SettingsTab = typeof tabs[number]["id"];
 const commonFpsOptions = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
 
 export function presetSummary(preset: Preset) {
+  if (preset.outputContainer === "mp3") return "MP3 · 320 kbps · 仅音频";
+  if (preset.outputContainer === "m4a") return "M4A · AAC 320 kbps · 仅音频";
+  if (preset.outputContainer === "wav") return `WAV · ${preset.wavEncoding === "float32" ? "32-bit Float" : preset.wavEncoding === "pcm24" ? "24-bit PCM" : "16-bit PCM"} · 仅音频`;
   const size = preset.resolutionMode === "source" ? "原尺寸"
     : preset.resolutionMode === "short_edge" ? `短边 ${preset.shortEdge}p`
     : preset.resolutionMode === "custom" ? `${preset.customWidth}×${preset.customHeight}` : `${preset.scalePercent}% 尺寸`;
@@ -27,6 +30,7 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
 }) {
   const [activeTab, setActiveTab] = useState<SettingsTab>("common");
   const uid = useId();
+  const audioOnly = ["m4a", "wav", "mp3"].includes(preset.outputContainer);
   const streamCopy = preset.hdrMode === "dolby_vision";
   const targetRate = preset.bitrateMode === "target_mbps";
   const rate = targetRate ? preset.targetBitrateMbps : Number((preset.bitrateMultiplier * 100).toFixed(2));
@@ -47,25 +51,25 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
           event.preventDefault();
           setActiveTab(tabs[next].id);
           event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
-        }}>{tab.label}{tab.id === "color" && (preset.lutEnabled || !["source", "sdr"].includes(preset.hdrMode) || preset.toneMap !== "auto") && <span className="tab-indicator" aria-label="已启用色彩处理" />}</button>)}
+        }}>{tab.label}{tab.id === "color" && !audioOnly && (preset.lutEnabled || !["source", "sdr"].includes(preset.hdrMode) || preset.toneMap !== "auto") && <span className="tab-indicator" aria-label="已启用色彩处理" />}</button>)}
     </div>
     {tabs.map((tab) => <div key={tab.id} id={`${uid}-${tab.id}-panel`} className="output-tabpanel" role="tabpanel"
       aria-labelledby={`${uid}-${tab.id}-tab`} hidden={activeTab !== tab.id} tabIndex={0}>
       {tab.id === "common" && <>
         <section className="output-group"><h3>编码格式</h3><div className="settings-pair">
-          <Field label="视频编码"><select title={codecLabels[preset.codec]} value={preset.codec} onChange={(event) => onChange(event.target.value === "prores"
+          <Field label="视频编码"><select disabled={audioOnly} title={audioOnly ? "仅音频输出不使用视频编码" : codecLabels[preset.codec]} value={preset.codec} onChange={(event) => onChange(event.target.value === "prores"
             ? { codec: "prores", bitDepth: 10, chroma: "422", hardware: "cpu", outputContainer: "mov" }
             : { codec: event.target.value as Codec })}>{Object.entries(codecLabels).map(([value, label]) => <option key={value} value={value}>{value === "h265" ? "H.265" : value === "h264" ? "H.264" : value === "prores" ? "ProRes LT" : label}</option>)}</select></Field>
           <Field label="封装格式"><select value={preset.outputContainer} onChange={(event) => onChange({ outputContainer: event.target.value as Preset["outputContainer"] })}>
-            <option value="source">跟随源文件</option>{["mp4", "mov", "avi", "mkv", "webm", "m4v"].map((value) => <option key={value} value={value}>{value.toUpperCase()}</option>)}<option value="m4a">M4A（仅音频）</option><option value="wav">WAV（仅音频）</option>
+            <option value="source">跟随源文件</option>{["mp4", "mov", "avi", "mkv", "webm", "m4v"].map((value) => <option key={value} value={value}>{value.toUpperCase()}</option>)}<option value="m4a">M4A（仅音频）</option><option value="wav">WAV（仅音频）</option><option value="mp3">MP3（仅音频 · 320 kbps）</option>
           </select></Field>
-        </div>{["source", "m4a", "wav"].includes(preset.outputContainer) && <small className="field-note">{preset.outputContainer === "source" ? "INSV 默认输出 MP4（ProRes 使用 MOV）；序列帧和音频默认使用 MP4。" : "仅导出音频，不包含视频画面。"}</small>}</section>
+        </div>{(preset.outputContainer === "source" || audioOnly) && <small className="field-note">{preset.outputContainer === "source" ? "INSV 默认输出 MP4（ProRes 使用 MOV）；序列帧和音频默认使用 MP4。" : preset.outputContainer === "mp3" ? "使用 MP3 编码，以 320 kbps 导出音频。源文件需包含音轨，或为任务附加外接音频。" : "仅导出音频，不包含视频画面。"}</small>}</section>
         {preset.outputContainer === "wav" && <section className="output-group"><h3>WAV 音频</h3>
           <Field label="采样格式"><select value={preset.wavEncoding} onChange={(event) => onChange({ wavEncoding: event.target.value as Preset["wavEncoding"] })}>
             <option value="pcm16">16-bit PCM（默认，优先兼容）</option><option value="pcm24">24-bit PCM（后期处理）</option><option value="float32">32-bit Float（浮点）</option>
           </select></Field><small className="field-note">遇到导入兼容问题时优先选择 16-bit PCM。部分软件不支持 32-bit Float；提高位深不会恢复源文件已丢失的细节。</small>
         </section>}
-        <section className="output-group"><h3>画面尺寸</h3><div className="settings-pair">
+        {!audioOnly && <><section className="output-group"><h3>画面尺寸</h3><div className="settings-pair">
           <Field label="分辨率"><select disabled={streamCopy} value={resolution} onChange={(event) => {
             const value = event.target.value;
             onChange(value === "source" || value === "scale_percent" || value === "custom" ? { resolutionMode: value } : { resolutionMode: "short_edge", shortEdge: Number(value) });
@@ -88,9 +92,10 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
         <details className="encoding-details"><summary><span>编码加速</span><small>{preset.hardware === "auto" ? "自动选择" : preset.hardware.toUpperCase()}</small><ChevronDown size={14} /></summary>
           <Field label="硬件"><select value={preset.hardware} onChange={(event) => onChange({ hardware: event.target.value as Hardware })}>{platform.accelerators.map((hardware) => <option key={hardware} value={hardware}>{hardware === "auto" ? "自动选择" : hardware.toUpperCase()}</option>)}</select></Field>
           <label className="inline-check"><input type="checkbox" checked={preset.cpuFallback} onChange={(event) => onChange({ cpuFallback: event.target.checked })} /><span>硬件失败时回退 CPU</span></label>
-        </details>
+        </details></>}
       </>}
-      {tab.id === "color" && <>
+      {(tab.id === "color" || tab.id === "panorama") && audioOnly && <div className="source-color-note"><ShieldCheck size={15} />仅音频输出无需画面、色彩、LUT 或全景处理。切换为视频封装后可继续设置。</div>}
+      {tab.id === "color" && !audioOnly && <>
         <section className="output-group"><h3>色彩与 HDR</h3>
           <Field label="HDR 模式"><select value={preset.hdrMode} onChange={(event) => {
             const hdrMode = event.target.value as Preset["hdrMode"];
@@ -111,7 +116,7 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
         </section>
         <section className="output-group"><h3>透明通道</h3><Field label="Alpha 背景"><select value={preset.alphaBackground} onChange={(event) => onChange({ alphaBackground: event.target.value as AlphaBackground })}><option value="checkerboard">棋盘格（默认）</option><option value="black">黑底</option><option value="white">白底</option></select></Field><small className="field-note">仅对含 Alpha 通道的素材合成背景。</small></section>
       </>}
-      {tab.id === "panorama" && <>
+      {tab.id === "panorama" && !audioOnly && <>
         <div className="source-color-note"><ShieldCheck size={15} />INSV 先拼接为 2:1 全景，再按“常用”和“色彩”设置输出。以下处理仅适用于 INSV 原片。</div>
         <section className="output-group"><h3>防抖与朝向</h3>
           <Field label="防抖模式"><select value={preset.panorama.stabilization} onChange={(event) => onChange({ panorama: { ...preset.panorama, stabilization: event.target.value as Preset["panorama"]["stabilization"] } })}>
@@ -142,7 +147,7 @@ export function OutputSettings({ preset, platform, onChange, onChooseLut, onChoo
           <div className="naming-preview"><small>命名示例</small><span>{preset.namingMode === "suffix_prefix" ? `${preset.prefix}原文件名${preset.suffix}` : "原文件名"}<em>{preset.outputContainer === "source" ? ".原后缀" : `.${preset.outputContainer}`}</em></span></div>
         </section>
         <section className="output-group"><h3>文件信息</h3><label className="time-preservation-card"><input type="checkbox" checked={preset.keepTimes} onChange={(event) => onChange({ keepTimes: event.target.checked })} /><Clock3 size={17} /><span><strong>保留原始时间</strong><small>恢复创建日期和修改时间</small></span><CheckCircle2 size={16} className={preset.keepTimes ? "is-on" : ""} /></label>
-          <label className="inline-check"><input type="checkbox" checked={preset.keepPanorama} onChange={(event) => onChange({ keepPanorama: event.target.checked })} /><span>识别并保留全景元数据</span></label>
+          {!audioOnly && <label className="inline-check"><input type="checkbox" checked={preset.keepPanorama} onChange={(event) => onChange({ keepPanorama: event.target.checked })} /><span>识别并保留全景元数据</span></label>}
         </section>
       </>}
     </div>)}

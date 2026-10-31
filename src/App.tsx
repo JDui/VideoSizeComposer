@@ -3,6 +3,8 @@ import packageMetadata from "../package.json";
 import appIcon from "../assets/app-icon.png";
 import { applyTheme } from "./theme";
 import { ThemeSettings } from "./ThemeSettings";
+import { Insta360Settings } from "./Insta360Settings";
+import { MediaEditor, mediaEditSummary, constrainMediaEdits, isPanoramaMedia } from "./MediaEditor";
 import {
   Check,
   ChevronDown,
@@ -59,7 +61,7 @@ import {
   setAdaptiveConcurrency,
   startEncode
 } from "./tauri";
-import type { AppPreferences, EncodeJob, Hardware, PlatformInfo, Preset, QueueItem, SourceColorChoice, ToolStatus } from "./types";
+import type { AppPreferences, EncodeJob, Hardware, MediaEdits, PlatformInfo, Preset, QueueItem, SourceColorChoice, ToolStatus } from "./types";
 import { codecLabels, OutputSettings, presetSummary } from "./OutputSettings";
 
 const defaultPlatform: PlatformInfo = { os: "unknown", accelerators: ["auto", "cpu"] };
@@ -123,11 +125,13 @@ export default function App() {
   const [presetFilter, setPresetFilter] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [mediaInfoItemId, setMediaInfoItemId] = useState("");
+  const [mediaEditorItemId, setMediaEditorItemId] = useState("");
   const [presetRailCollapsed, togglePresetRail] = useToggleState("vsc.presetRailCollapsed", false);
   const [presetListOpen, togglePresetList] = useToggleState("vsc.presetListOpen", true);
   const [presetEditorOpen, setPresetEditorOpen] = useState(false);
   const [presetDraft, setPresetDraft] = useState<Preset>();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sdkSetupBusy, setSdkSetupBusy] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [sequenceImportOpen, setSequenceImportOpen] = useState(false);
@@ -186,11 +190,11 @@ export default function App() {
   const savings = totalSourceSize > 0 ? Math.max(0, Math.round((1 - totalEstimatedSize / totalSourceSize) * 100)) : 0;
   const completedCount = queue.filter((item) => item.status.includes("完成")).length;
   const failedCount = queue.filter((item) => item.status.includes("失败")).length;
-  const activeDuration = activeJobIds.reduce((sum, id) => sum + (queue.find((item) => item.id === id)?.duration ?? 0), 0);
+  const activeDuration = activeJobIds.reduce((sum, id) => sum + editedDuration(queue.find((item) => item.id === id)), 0);
   const overallProgress = activeDuration > 0
     ? Math.round(activeJobIds.reduce((sum, id) => {
         const item = queue.find((entry) => entry.id === id);
-        return sum + (item?.duration ?? 0) * (item?.progress ?? 0);
+        return sum + editedDuration(item) * (item?.progress ?? 0);
       }, 0) / activeDuration)
     : 0;
   const remainingTimeLabel = isEncoding && encodeStartedAt
@@ -507,7 +511,7 @@ export default function App() {
     const clientX = keyboardClick ? anchor.right : event.clientX;
     const clientY = keyboardClick ? anchor.bottom : event.clientY;
     const width = 208;
-    const height = kind === "preset" ? 184 : 148;
+    const height = 184;
     setContextMenu({
       kind,
       id,
@@ -551,10 +555,35 @@ export default function App() {
     setContextMenu(undefined);
   }
 
+  function openMediaEditor(item: QueueItem) {
+    if (isItemEncoding(item)) {
+      setNotice("请等待此素材编码结束后再编辑");
+      return;
+    }
+    setContextMenu(undefined);
+    setDetailsOpen(false);
+    setMediaEditorItemId(item.id);
+  }
+
+  function applyMediaEdits(itemId: string, edits: MediaEdits) {
+    setQueue((items) => items.map((item) => {
+      if (item.id !== itemId || isItemEncoding(item)) return item;
+      const preset = presetForItem(item, presets, activePreset);
+      const next = { ...item, edits: constrainMediaEdits(item, edits), progress: 0, status: "就绪", alphaOutput: "" };
+      return { ...next, output: preset ? previewOutput(next, preset) : "" };
+    }));
+    setMediaEditorItemId("");
+    setNotice("素材编辑已应用");
+  }
+
   function togglePanorama(itemId: string) {
-    setQueue((items) => items.map((item) => item.id === itemId && !/\.insv$/i.test(item.source)
-      ? { ...item, isPanorama: !item.isPanorama }
-      : item));
+    setQueue((items) => items.map((item) => {
+      if (item.id !== itemId || /\.insv$/i.test(item.source) || isItemEncoding(item)) return item;
+      const next = { ...item, isPanorama: !item.isPanorama };
+      if (next.edits) next.edits = constrainMediaEdits(next, next.edits);
+      const preset = presetForItem(next, presets, activePreset);
+      return { ...next, output: preset ? previewOutput(next, preset) : "" };
+    }));
   }
 
   /** 未标注 / 错标的 HLG、PQ 素材由用户确认后手动指定解释方式，随任务一起交给后端。 */
@@ -665,6 +694,7 @@ export default function App() {
     if (preferences.confirmBeforeClear && !window.confirm("清空当前媒体列表？")) return;
     setQueue([]);
     setMediaInfoItemId("");
+    setMediaEditorItemId("");
   }
 
   async function encodeSelected() {
@@ -828,7 +858,6 @@ export default function App() {
       initialSelected: new Set(queue.filter((item) => item.selected).map((item) => item.id)),
       dragging: false
     };
-    body.setPointerCapture(event.pointerId);
   }
 
   function moveMarquee(event: React.PointerEvent<HTMLDivElement>) {
@@ -836,6 +865,7 @@ export default function App() {
     const body = queueBodyRef.current;
     if (!start || !body || start.pointerId !== event.pointerId) return;
     if (!start.dragging && Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) < 5) return;
+    if (!start.dragging) body.setPointerCapture(event.pointerId);
     start.dragging = true;
     event.preventDefault();
     const bounds = body.getBoundingClientRect();
@@ -983,13 +1013,25 @@ export default function App() {
                     className={`media-row ${item.selected ? "is-selected" : ""}`}
                     key={item.id}
                     data-item-id={item.id}
+                    tabIndex={0}
+                    title={isPanoramaMedia(item) ? "全景禁止裁切；双击编辑片段与 LUT，也可按 Enter 打开" : "双击编辑画幅、裁切、片段与 LUT；也可按 Enter 打开"}
                     onClick={(event) => handleRowClick(event, item.id)}
+                    onDoubleClick={(event) => {
+                      if ((event.target as HTMLElement).closest("button, input, select, label, a")) return;
+                      openMediaEditor(item);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && event.target === event.currentTarget) {
+                        event.preventDefault();
+                        openMediaEditor(item);
+                      }
+                    }}
                     onContextMenu={(event) => openContextMenu("media", item.id, event)}
                   >
                     <label className="row-check" title="按住 Shift 可连续选择" onClick={(event) => { event.preventDefault(); event.stopPropagation(); updateItemSelection(item.id, !item.selected, event.shiftKey); }}><input type="checkbox" checked={item.selected} readOnly /><span><Check size={12} /></span><em>{index + 1}</em></label>
                     <div className="media-identity">{item.thumbnail ? <img src={item.thumbnail} alt={`${item.fileName} 媒体缩略图`} draggable={false} /> : <span className="video-thumb-fallback">{item.mediaKind === "sequence" ? <Images size={19} /> : item.mediaKind === "audio" ? <Zap size={19} /> : <Film size={19} />}</span>}<span className="media-copy"><strong>{item.fileName}</strong><small>{item.mediaKind === "sequence" ? `${item.sequenceFrameCount} 帧 · ${formatDuration(item.duration)}` : item.mediaKind === "audio" ? `音频 · ${formatDuration(item.duration)}` : formatDuration(item.duration)}</small>{presetName && <span className="media-preset" title={`使用预设：${presetName}`}>预设：{presetName}</span>}<button className="path-link source-path" title={item.source} onClick={(event) => { event.stopPropagation(); revealItemPath(item.source); }}>{shortPath(item.source)}</button>{item.mediaKind === "sequence" && <button className="sequence-settings-button" onClick={(event) => { event.stopPropagation(); setSequenceDraft({ ...item }); }}><SlidersHorizontal size={12} />序列设置</button>}{item.mediaKind === "audio" && <label className="row-inline-control" title="音频素材输出视频时使用的画面模式" onClick={(event) => event.stopPropagation()}><span>画面</span><select value={item.audioVisual} onChange={(event) => updateAudioVisual(item.id, event.target.value as QueueItem["audioVisual"])}><option value="timecode">时间码</option><option value="black">纯黑</option><option value="white">纯白</option></select></label>}{item.mediaKind !== "audio" && item.audioTracks === 0 && <button className="audio-attach-control" title={item.externalAudio || "添加外接音频"} onClick={(event) => { event.stopPropagation(); chooseExternalAudio(item.id); }}>{item.externalAudio ? `已添加音频 · ${shortPath(item.externalAudio)}` : "无音轨 · 添加音频"}</button>}{item.externalAudio && item.mediaKind !== "audio" && <button className="audio-clear-control" aria-label="清除外接音频" title="清除外接音频" onClick={(event) => { event.stopPropagation(); clearExternalAudio(item.id); }}><X size={11} /></button>}</span></div>
                     <div className="source-spec"><span>{item.width}×{item.height} · {item.fps}{item.mediaKind === "sequence" && item.sequencePixelAspect !== 1 ? ` · 像素 ${item.sequencePixelAspect.toFixed(2)}x` : ""}</span><span>{item.codec} · {item.mediaKind === "audio" ? "纯音频" : `${item.bitDepth || 8}-bit · 4:2:${item.chroma.slice(-1)}`} · {formatBytes(item.sizeBytes)}</span><span className="media-badges">{item.hasAlpha && <em>Alpha</em>}{item.exportAlphaMask && <em>Alpha 遮罩已启用</em>}{item.mediaKind === "audio" && <em>音频素材</em>}{item.mediaKind === "sequence" && <em>序列帧</em>}{item.hdrMode !== "sdr" && <em>{hdrLabel(item.hdrMode)}</em>}{isSuspectHdr(item) && <em className="suspect" title="源没有写色彩元数据，但宽色域 + 10-bit 提示它可能是 HLG / HDR。打开源信息确认后再按 HDR 编码。">HDR（未标注）</em>}{item.panoramaTagged && <em>自动识别</em>}{item.audioTracks > 1 && <em>{item.audioTracks} 音轨</em>}{item.subtitleTracks > 0 && <em>{item.subtitleTracks} 字幕</em>}{item.mediaKind !== "audio" && <button className={`panorama-toggle ${item.isPanorama ? "is-on" : ""}`} disabled={/\.insv$/i.test(item.source)} title={/\.insv$/i.test(item.source) ? "INSV 原片必须先进行全景拼接" : "点击切换全景状态"} onClick={(event) => { event.stopPropagation(); togglePanorama(item.id); }}>{item.isPanorama ? "全景视频" : "非全景视频"}</button>}</span>{item.hasAlpha && item.mediaKind !== "audio" && <label className="alpha-mask-control" title="从源 Alpha 通道生成独立黑白视频" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={item.exportAlphaMask} onChange={(event) => toggleAlphaMask(item.id, event.target.checked)} /><span>单独导出 Alpha 遮罩</span></label>}</div>
-                    <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? codecLabels[itemPreset.codec] : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span></div>
+                    <div className="output-spec"><strong>{formatBytes(predicted)}</strong><span>{itemPreset ? outputFormatLabel(itemPreset) : "未选择预设"}</span><span>{targetResolution(item, itemPreset)}</span>{mediaEditSummary(item) && <span className="item-edit-summary" title={mediaEditSummary(item)}>{mediaEditSummary(item)}</span>}</div>
                     <StatusCell item={item} outputPath={outputPath} onRevealPath={revealItemPath} />
                     <button className="row-disclosure" aria-label={`查看 ${item.fileName} 详情`} onClick={(event) => { event.stopPropagation(); openMediaInfo(item); }}><ChevronRight size={19} /></button>
                   </article>
@@ -1076,6 +1118,7 @@ export default function App() {
             if (!item) return null;
             const disabled = isItemEncoding(item);
             return <>
+              <button role="menuitem" disabled={disabled} onClick={() => openMediaEditor(item)}>编辑素材</button>
               <button role="menuitem" onClick={() => openMediaInfo(item)}>查看源信息</button>
               <button role="menuitem" disabled={disabled} onClick={() => resetQueueItem(item)}>重置状态</button>
               <button role="menuitem" className="danger" disabled={disabled} onClick={() => deleteQueueItem(item)}>删除</button>
@@ -1084,7 +1127,7 @@ export default function App() {
         </div>
       )}
 
-      {settingsOpen && <Modal title="应用设置" onClose={() => setSettingsOpen(false)} footer={<><button className="secondary-button" onClick={() => setPreferencesDraft(defaultPreferences)}>恢复默认</button><button className="primary-button" onClick={commitPreferences}>保存设置</button></>}>
+      {settingsOpen && <Modal title="应用设置" onClose={() => setSettingsOpen(false)} footer={<><button className="secondary-button" disabled={sdkSetupBusy} onClick={() => setPreferencesDraft(defaultPreferences)}>恢复默认</button><button className="primary-button" disabled={sdkSetupBusy} onClick={commitPreferences}>保存设置</button></>}>
         <ThemeSettings colors={preferencesDraft.theme} onChange={(theme) => setPreferencesDraft((draft) => ({ ...draft, theme }))} />
         <div className="modal-grid two-columns">
           <Setting label="默认输出策略"><select value={preferencesDraft.defaultOutputMode} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, defaultOutputMode: event.target.value as Preset["outputMode"] }))}><option value="subfolder">原位子文件夹</option><option value="in_place">原位导出</option><option value="single_folder">全部到同一目录</option></select></Setting>
@@ -1098,12 +1141,7 @@ export default function App() {
           <div className="hardware-device-list"><span className="field-note">可用设备</span>{platform.accelerators.filter((item) => item !== "auto").map((accelerator) => <button className={`hardware-row ${preferencesDraft.defaultHardware === accelerator ? "selected" : ""}`} key={accelerator} onClick={() => setPreferencesDraft((draft) => ({ ...draft, defaultHardware: accelerator }))}><span className={`status-dot ${accelerator === "cpu" ? "blue" : ""}`} /><strong>{accelerator === "cuda" ? "CUDA" : accelerator === "metal" ? "Metal" : "CPU"}</strong><small>{accelerator === "cuda" ? "NVIDIA GPU" : accelerator === "metal" ? "Apple GPU" : "自动回退"}</small></button>)}</div>
           <div className="environment-card"><strong>编码环境</strong><span>{toolStatus.ok ? "FFmpeg 与 FFprobe 可用" : "编码工具不可用"}</span><small>{toolStatus.ffmpeg}</small><small>{toolStatus.ffprobe}</small><small>{toolStatus.encoders.length ? `可用编码器：${toolStatus.encoders.join("、")}` : "未检测到硬件编码器"}</small></div>
         </div>
-        <div className="modal-section">
-          <h3>Insta360 全景处理</h3>
-          <Setting label="Desktop Media SDK 目录"><input value={preferencesDraft.insta360SdkPath} placeholder="留空时自动检测程序旁的 insta360/" onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, insta360SdkPath: event.target.value }))} /></Setting>
-          <button className="secondary-button full" onClick={async () => { const paths = await pickFolder(); if (paths[0]) setPreferencesDraft((draft) => ({ ...draft, insta360SdkPath: paths[0] })); }}><FolderOpen size={15} />选择 SDK 目录</button>
-          <small className="field-note">{toolStatus.insta360Sdk ? `已找到程序（编码前检查参数与模型）：${toolStatus.insta360Sdk}` : "未找到 MediaSDKTest。INSV 可以导入，拼接导出需先配置官方 SDK。"}</small>
-        </div>
+        <Insta360Settings path={preferencesDraft.insta360SdkPath} onChange={(insta360SdkPath) => setPreferencesDraft((draft) => ({ ...draft, insta360SdkPath }))} onBusyChange={setSdkSetupBusy} />
         <div className="preference-list">
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.keepTimesByDefault} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, keepTimesByDefault: event.target.checked }))} /><span>新任务默认保留创建日期与修改时间</span></label>
           <label className="inline-check"><input type="checkbox" checked={preferencesDraft.confirmBeforeClear} onChange={(event) => setPreferencesDraft((draft) => ({ ...draft, confirmBeforeClear: event.target.checked }))} /><span>清空媒体列表前要求确认</span></label>
@@ -1145,6 +1183,13 @@ export default function App() {
         </div>
         <div className="modal-section"><h3>分辨率</h3><div className="dimension-grid modal-dimensions"><Setting label="宽"><input type="number" min={2} value={sequenceDraft.width} onChange={(event) => setSequenceDraft((draft) => draft ? { ...draft, width: Number(event.target.value) } : draft)} /></Setting><span>×</span><Setting label="高"><input type="number" min={2} value={sequenceDraft.height} onChange={(event) => setSequenceDraft((draft) => draft ? { ...draft, height: Number(event.target.value) } : draft)} /></Setting></div></div>
       </Modal>}
+
+      {mediaEditorItemId && (() => {
+        const item = queue.find((entry) => entry.id === mediaEditorItemId);
+        const preset = item ? presetForItem(item, presets, activePreset) : undefined;
+        return item && preset ? <MediaEditor key={item.id} item={item} preset={preset}
+          onApply={(edits) => applyMediaEdits(item.id, edits)} onClose={() => setMediaEditorItemId("")} /> : null;
+      })()}
 
       {notice && <div className="toast" role="status">{notice}</div>}
       {lastError && !detailsOpen && <button className="error-banner" onClick={() => setDetailsOpen(true)}><CircleAlert size={17} />{lastError}</button>}
@@ -1299,24 +1344,26 @@ function presetNameForItem(item: QueueItem, presets: Preset[], fallback?: Preset
 }
 
 function estimateOutputBytes(item: QueueItem, preset?: Preset) {
-  if (!preset || !item.duration) return 0;
+  const duration = editedDuration(item);
+  if (!preset || !duration) return 0;
+  const durationRatio = item.duration > 0 ? duration / item.duration : 1;
   const outputContainer = preset.outputContainer === "source" && item.mediaKind === "audio" ? "mp4" : preset.outputContainer;
   if (outputContainer === "wav") {
     const bytesPerSample = preset.wavEncoding === "float32" ? 4 : preset.wavEncoding === "pcm24" ? 3 : 2;
     // Approximate using 48 kHz stereo; actual sample rate/channels follow the source.
-    return Math.max(44_100, Math.round(item.duration * 48_000 * 2 * bytesPerSample));
+    return Math.max(44_100, Math.round(duration * 48_000 * 2 * bytesPerSample));
   }
-  if (item.mediaKind === "audio" && outputContainer === "m4a") {
-    return Math.max(32_000, Math.round(item.duration * 320_000 / 8));
+  if (outputContainer === "mp3" || outputContainer === "m4a") {
+    return Math.max(1_024, Math.round(duration * 320_000 / 8 * 1.025));
   }
-  if (preset.hdrMode === "dolby_vision") return item.sizeBytes;
+  if (preset.hdrMode === "dolby_vision") return item.sizeBytes * durationRatio;
   if (preset.codec === "prores") {
-    const value = Math.max(item.sizeBytes, item.duration * 100_000_000 / 8);
+    const value = Math.max(item.sizeBytes * durationRatio, duration * 100_000_000 / 8);
     return item.exportAlphaMask && item.hasAlpha ? value * 1.3 : value;
   }
   if (preset.bitrateMode === "source_multiplier" && item.sizeBytes > 0) {
-    const videoShare = item.sizeBytes * preset.bitrateMultiplier;
-    const audioOverhead = item.audioTracks > 0 || item.externalAudio ? item.duration * 320_000 / 8 : 0;
+    const videoShare = item.sizeBytes * durationRatio * preset.bitrateMultiplier;
+    const audioOverhead = item.audioTracks > 0 || item.externalAudio ? duration * 320_000 / 8 : 0;
     const value = Math.max(1_000_000, (videoShare + audioOverhead) * 1.025);
     return item.exportAlphaMask && item.hasAlpha ? value * 1.3 : value;
   }
@@ -1324,15 +1371,32 @@ function estimateOutputBytes(item: QueueItem, preset?: Preset) {
     ? item.bitrate * preset.bitrateMultiplier
     : preset.targetBitrateMbps * 1_000_000;
   const audioBitrate = item.audioTracks > 0 || item.externalAudio ? 320_000 : 0;
-  const value = Math.max(1_000_000, (videoBitrate + audioBitrate) * item.duration / 8 * 1.025);
+  const value = Math.max(1_000_000, (videoBitrate + audioBitrate) * duration / 8 * 1.025);
   return item.exportAlphaMask && item.hasAlpha ? value * 1.3 : value;
 }
 
 function targetResolution(item: QueueItem, preset?: Preset) {
-  if (!preset || preset.resolutionMode === "source") return `${item.width}×${item.height}`;
+  if (preset && ["mp3", "m4a", "wav"].includes(preset.outputContainer)) return "仅音频";
+  const width = item.edits?.canvasWidth || item.edits?.crop?.width || item.width;
+  const height = item.edits?.canvasHeight || item.edits?.crop?.height || item.height;
+  if (!preset || preset.resolutionMode === "source") return `${width}×${height}`;
   if (preset.resolutionMode === "scale_percent") return `原尺寸 ${preset.scalePercent}%`;
   if (preset.resolutionMode === "custom") return `${preset.customWidth}×${preset.customHeight}`;
   return `短边 ${preset.shortEdge}p`;
+}
+
+function editedDuration(item?: QueueItem) {
+  if (!item) return 0;
+  const start = item.edits?.trimStart ?? 0;
+  const end = item.edits?.trimEnd || item.duration;
+  return Math.max(0, Math.min(item.duration, end) - start);
+}
+
+function outputFormatLabel(preset: Preset) {
+  if (preset.outputContainer === "mp3") return "MP3 · 320 kbps";
+  if (preset.outputContainer === "m4a") return "M4A · AAC 320 kbps";
+  if (preset.outputContainer === "wav") return `WAV · ${preset.wavEncoding === "float32" ? "32-bit Float" : preset.wavEncoding === "pcm24" ? "24-bit PCM" : "16-bit PCM"}`;
+  return codecLabels[preset.codec];
 }
 
 function outputDirectory(preset?: Preset) {

@@ -22,6 +22,9 @@ use walkdir::WalkDir;
 
 mod insta360;
 use insta360::{is_insv, PanoramaPreferences};
+mod media_edit;
+use media_edit::MediaEdits;
+mod sdk_setup;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "3g2", "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "mxf",
@@ -238,6 +241,8 @@ struct QueueItem {
     external_audio: String,
     #[serde(default = "default_audio_visual")]
     audio_visual: String,
+    #[serde(default)]
+    edits: Option<MediaEdits>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +303,7 @@ impl Default for QueueItem {
             alpha_output: String::new(),
             external_audio: String::new(),
             audio_visual: default_audio_visual(),
+            edits: None,
         }
     }
 }
@@ -431,6 +437,10 @@ pub fn run() {
             start_encode,
             cancel_encode,
             set_adaptive_concurrency,
+            media_edit::preview_media_edit,
+            sdk_setup::detect_insta360_sdk,
+            sdk_setup::setup_insta360_sdk,
+            sdk_setup::open_insta360_sdk_download,
             reveal_path
         ])
         .setup(|app| {
@@ -578,6 +588,7 @@ fn detected_encoders() -> Vec<String> {
                     "hevc_nvenc",
                     "h264_videotoolbox",
                     "hevc_videotoolbox",
+                    "libmp3lame",
                 ] {
                     if text.contains(encoder) {
                         encoders.push(encoder.to_string());
@@ -1095,6 +1106,9 @@ async fn start_encode(app: tauri::AppHandle, jobs: Vec<EncodeJob>, adaptive: boo
 /// 编码域峰值在这里抽样一次写回 item；只在「HDR→SDR 且策略为 auto」时才解码。
 fn prepare_source_peak(job: &mut EncodeJob, cancel: &AtomicBool) {
     job.item.coded_peak_ratio = 0.0;
+    if matches!(output_extension(&job.item, &job.preset).as_str(), "m4a" | "wav" | "mp3") {
+        return;
+    }
     if job.preset.hdr_mode != "sdr" || !matches!(job.preset.tone_map.as_str(), "" | "auto") {
         return;
     }
@@ -1229,7 +1243,7 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
     }
     if !matches!(
         preset.output_container.as_str(),
-        "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav"
+        "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav" | "mp3"
     ) {
         return Err(format!("不支持的封装格式：{}", preset.output_container));
     }
@@ -1262,6 +1276,14 @@ fn validate_preset(preset: &Preset) -> Result<(), String> {
 }
 
 fn validate_job(job: &EncodeJob) -> Result<(), String> {
+    let mut effective_job = EncodeJob { item: job.item.clone(), preset: media_edit::effective_preset(&job.item, &job.preset) };
+    if matches!(output_extension(&job.item, &job.preset).as_str(), "m4a" | "wav" | "mp3") {
+        effective_job.preset.hdr_mode = "source".into();
+        effective_job.preset.color_space = "source".into();
+        effective_job.preset.lut_enabled = false;
+    }
+    let job = &effective_job;
+    media_edit::validate(&job.item, &job.preset)?;
     validate_preset(&job.preset)?;
     if is_insv(Path::new(&job.item.source)) {
         insta360::validate_insv_job(&job.item, &job.preset)?;
@@ -1277,7 +1299,7 @@ fn validate_job(job: &EncodeJob) -> Result<(), String> {
             return Err(format!("外接文件没有可读音轨：{}", external.display()));
         }
     }
-    if matches!(container.as_str(), "m4a" | "wav")
+    if matches!(container.as_str(), "m4a" | "wav" | "mp3")
         && job.item.audio_tracks == 0
         && !has_external_audio
     {
@@ -1301,13 +1323,19 @@ fn validate_job(job: &EncodeJob) -> Result<(), String> {
             ));
         }
     }
-    if job.item.media_kind == "audio"
+    if !matches!(container.as_str(), "m4a" | "wav" | "mp3") && job.item.media_kind == "audio"
         && job.item.audio_visual == "timecode"
         && !filter_available("drawtext")
     {
         return Err(
             "当前 FFmpeg 不包含 drawtext 滤镜，无法生成音频时间码画面；请选择纯黑或纯白画面".into(),
         );
+    }
+    if matches!(container.as_str(), "m4a" | "wav" | "mp3") {
+        if container == "mp3" && !encoder_available("libmp3lame") {
+            return Err("当前 FFmpeg 不包含 libmp3lame 编码器，无法导出 MP3".into());
+        }
+        return Ok(());
     }
     if container == "webm" && job.preset.codec != "av1" {
         return Err(format!(
@@ -1385,11 +1413,18 @@ fn validate_job(job: &EncodeJob) -> Result<(), String> {
 }
 
 fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
-    if item.media_kind == "audio" && matches!(output_extension(item, preset).as_str(), "wav") {
-        return (item.duration.max(1.0) * 3.0 * 48_000.0) as u64;
+    let duration = media_edit::duration(item).max(0.001);
+    let fraction = (duration / item.duration.max(0.001)).min(1.0);
+    let container = output_extension(item, preset);
+    if container == "wav" {
+        let bytes = match preset.wav_encoding.as_str() { "float32" => 4.0, "pcm24" => 3.0, _ => 2.0 };
+        return (duration * 2.0 * 48_000.0 * bytes * 1.10) as u64 + 4096;
+    }
+    if matches!(container.as_str(), "m4a" | "mp3") {
+        return (duration * 320_000.0 / 8.0 * 1.10) as u64 + 8192;
     }
     if preset.hdr_mode == "dolby_vision" {
-        return item.size_bytes;
+        return (item.size_bytes as f64 * fraction) as u64;
     }
     if preset.codec == "prores" {
         // ProRes 422 LT is a frame-oriented mezzanine codec.  A source-size
@@ -1401,7 +1436,6 @@ fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
         const PRORES_422_LT_BITS_PER_PIXEL_FRAME: f64 = 2.0;
         let (width, height) = estimated_output_dimensions(item, preset);
         let fps = estimated_output_fps(item, preset);
-        let duration = item.duration.max(1.0);
         let video_bits =
             (width as f64) * (height as f64) * fps * duration * PRORES_422_LT_BITS_PER_PIXEL_FRAME;
         let audio_bits = if item.audio_tracks > 0 || !item.external_audio.trim().is_empty() {
@@ -1414,8 +1448,7 @@ fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
             .saturating_mul(115)
             .saturating_div(100)
             .saturating_add(64 * 1024 * 1024);
-        return item
-            .size_bytes
+        return ((item.size_bytes as f64 * fraction) as u64)
             .saturating_mul(2)
             .max(with_margin)
             .max(64 * 1024 * 1024);
@@ -1426,12 +1459,11 @@ fn estimated_output_bytes(item: &QueueItem, preset: &Preset) -> u64 {
         0
     };
     let bits_per_second = target_bitrate(item, preset).saturating_add(audio_bits);
-    ((bits_per_second as f64 * item.duration.max(1.0) / 8.0) * 1.10) as u64
+    ((bits_per_second as f64 * duration / 8.0) * 1.10) as u64
 }
 
 fn estimated_output_dimensions(item: &QueueItem, preset: &Preset) -> (u64, u64) {
-    let source_width = u64::from(item.width.max(2));
-    let source_height = u64::from(item.height.max(2));
+    let (source_width, source_height) = media_edit::dimensions(item);
     match preset.resolution_mode.as_str() {
         "short_edge" => {
             let short_edge = u64::from(preset.short_edge.max(120));
@@ -2288,6 +2320,20 @@ fn unique_child_path(dir: &Path, file_name: &str) -> PathBuf {
     dir.join(format!("{stem}-{}.{}", Uuid::new_v4(), extension))
 }
 
+fn display_dimensions(video: &Value) -> (u32, u32) {
+    let width = video["width"].as_u64().unwrap_or(0) as u32;
+    let height = video["height"].as_u64().unwrap_or(0) as u32;
+    let rotation = video["side_data_list"].as_array()
+        .and_then(|side| side.iter().find_map(|data| data["rotation"].as_f64()))
+        .or_else(|| video["tags"]["rotate"].as_str().and_then(|v| v.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+    if rotation.is_finite() && (rotation.rem_euclid(180.0) - 90.0).abs() < 1.0 {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
     let output = command_with_hidden_window(resolve_tool("ffprobe"))
         .args([
@@ -2360,6 +2406,7 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         HdrMetadata::default()
     };
     let hdr_signal = detect_hdr_signal(&video, &hdr_mode, &hdr_meta);
+    let (display_width, display_height) = display_dimensions(&video);
 
     let mut item = QueueItem {
         id: Uuid::new_v4().to_string(),
@@ -2370,12 +2417,12 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
             .unwrap_or("unknown")
             .to_uppercase(),
         width: if has_video {
-            video["width"].as_u64().unwrap_or(0) as u32
+            display_width
         } else {
             1920
         },
         height: if has_video {
-            video["height"].as_u64().unwrap_or(0) as u32
+            display_height
         } else {
             1080
         },
@@ -2464,6 +2511,7 @@ fn probe_video(path: &Path, preset_id: &str) -> Result<QueueItem, String> {
         alpha_output: String::new(),
         external_audio: String::new(),
         audio_visual: default_audio_visual(),
+        edits: None,
     };
     if is_insv(path) {
         insta360::describe_insv(&mut item, &json)?;
@@ -2552,7 +2600,7 @@ fn encode_job(
     let mut stitched = if is_insv(&source)
         && !matches!(
             output_extension(&job.item, &job.preset).as_str(),
-            "m4a" | "wav"
+            "m4a" | "wav" | "mp3"
         ) {
         match insta360::prepare_insv(app, &job.item, &job.preset, &output, cancel) {
             Ok(prepared) => Some(prepared),
@@ -2566,6 +2614,7 @@ fn encode_job(
         None
     };
     if let Some(prepared) = stitched.as_mut() {
+        prepared.item.edits = job.item.edits.clone();
         let mut sample_job = EncodeJob { item: prepared.item.clone(), preset: job.preset.clone() };
         prepare_source_peak(&mut sample_job, cancel);
         prepared.item.coded_peak_ratio = sample_job.item.coded_peak_ratio;
@@ -2582,7 +2631,7 @@ fn encode_job(
         .as_ref()
         .map(|prepared| &prepared.item)
         .unwrap_or(&job.item);
-    let mut encoding_preset = job.preset.clone();
+    let mut encoding_preset = media_edit::effective_preset(&job.item, &job.preset);
     encoding_preset.output_container = output_extension(&job.item, &job.preset);
 
     let sequence_list = if job.item.media_kind == "sequence" {
@@ -2689,7 +2738,7 @@ fn encode_job(
         return Ok(());
     }
 
-    if job.preset.keep_panorama && encoding_item.is_panorama && is_isobmff_path(&temporary_output) {
+    if media_edit::preserve_panorama(encoding_item, &job.preset) && is_isobmff_path(&temporary_output) {
         if let Err(error) = inject_spherical_metadata(&temporary_output) {
             let _ = fs::remove_file(&temporary_output);
             return Err((item_id, format!("无法写入标准全景元数据: {error}")));
@@ -2861,7 +2910,7 @@ fn run_ffmpeg(
                     tail.remove(0);
                 }
             }
-            if let Some(progress) = parse_progress(&line, item.duration) {
+            if let Some(progress) = parse_progress(&line, media_edit::duration(item)) {
                 let (reported_output, alpha_output) = phase_output_paths(output, phase);
                 let _ = app.emit(
                     "encode-progress",
@@ -3142,7 +3191,7 @@ fn write_sequence_concat_file(item: &QueueItem, output: &Path) -> Result<PathBuf
     let mut text = String::from("ffconcat version 1.0\n");
     for frame in &item.sequence_frames {
         let escaped = frame.replace('\\', "/").replace('\'', "'\\''");
-        text.push_str(&format!("file '{escaped}'\n"));
+        text.push_str(&format!("file '{escaped}'\nduration {:.9}\n", 1.0 / item.sequence_fps.max(0.001)));
     }
     fs::write(&path, text).map_err(|error| format!("无法创建序列帧清单：{error}"))?;
     Ok(path)
@@ -3159,6 +3208,8 @@ fn build_ffmpeg_args_with_sequence(
     output: &Path,
     sequence_list: Option<&Path>,
 ) -> Vec<String> {
+    let effective = media_edit::effective_preset(item, preset);
+    let preset = &effective;
     if item.media_kind == "audio" || !item.external_audio.trim().is_empty() {
         return build_ffmpeg_args_with_audio(item, preset, output, sequence_list);
     }
@@ -3186,7 +3237,11 @@ fn build_ffmpeg_args_with_sequence(
         args.extend(["-i".into(), item.source.clone()]);
     }
 
-    if matches!(output_extension(item, preset).as_str(), "m4a" | "wav") {
+    media_edit::append_trim(&mut args, item);
+    if matches!(output_extension(item, preset).as_str(), "m4a" | "wav" | "mp3") {
+        if output_extension(item, preset) == "mp3" {
+            args.extend(["-ar".into(), "48000".into()]);
+        }
         args.extend([
             "-map".into(),
             "0:a:0?".into(),
@@ -3194,6 +3249,8 @@ fn build_ffmpeg_args_with_sequence(
             "-c:a".into(),
             if output_extension(item, preset) == "wav" {
                 wav_audio_codec(preset).into()
+            } else if output_extension(item, preset) == "mp3" {
+                "libmp3lame".into()
             } else {
                 "aac".into()
             },
@@ -3261,6 +3318,9 @@ fn build_ffmpeg_args_with_sequence(
     }
     append_frame_memory_safety_args(&mut args, item, preset);
 
+    if media_edit::has_geometry(item) && item.is_panorama {
+        args.extend(["-map_metadata:s:v:0".into(), "-1".into(), "-metadata:s:v:0".into(), "projection=".into(), "-metadata:s:v:0".into(), "stereo_mode=".into()]);
+    }
     let audio_codec = if output_extension(item, preset) == "webm" {
         "libopus"
     } else {
@@ -3272,7 +3332,7 @@ fn build_ffmpeg_args_with_sequence(
         "-b:a".into(),
         "320k".into(),
     ]);
-    if preset.keep_panorama && item.is_panorama {
+    if media_edit::preserve_panorama(item, preset) {
         args.extend([
             "-metadata:s:v:0".into(),
             "projection=equirectangular".into(),
@@ -3283,7 +3343,7 @@ fn build_ffmpeg_args_with_sequence(
     if let Some(movflags) = movflags_for_output(
         &preset.codec,
         &output_extension(item, preset),
-        preset.keep_panorama && item.is_panorama,
+        media_edit::preserve_panorama(item, preset),
     ) {
         args.extend(["-movflags".into(), movflags.into()]);
     }
@@ -3308,7 +3368,7 @@ fn build_ffmpeg_args_with_audio(
         "-nostats".into(),
     ];
 
-    if matches!(extension.as_str(), "m4a" | "wav") {
+    if matches!(extension.as_str(), "m4a" | "wav" | "mp3") {
         if let Some(list) = sequence_list {
             args.extend([
                 "-f".into(),
@@ -3327,6 +3387,7 @@ fn build_ffmpeg_args_with_audio(
             args.extend(["-i".into(), item.external_audio.clone()]);
             1
         };
+        media_edit::append_trim(&mut args, item);
         args.extend([
             "-map".into(),
             format!("{audio_index}:a:0?"),
@@ -3334,12 +3395,20 @@ fn build_ffmpeg_args_with_audio(
             "-c:a".into(),
             if extension == "wav" {
                 wav_audio_codec(preset).into()
+            } else if extension == "mp3" {
+                "libmp3lame".into()
             } else {
                 "aac".into()
             },
         ]);
-        if extension == "m4a" {
+        if matches!(extension.as_str(), "m4a" | "mp3") {
             args.extend(["-b:a".into(), "320k".into()]);
+        }
+        if extension == "mp3" {
+            args.extend(["-ar".into(), "48000".into()]);
+        }
+        if audio_index == 1 {
+            args.extend(["-af".into(), "apad".into(), "-t".into(), format!("{:.6}", media_edit::duration(item).max(0.001))]);
         }
         args.push(output.to_string_lossy().to_string());
         return args;
@@ -3380,6 +3449,7 @@ fn build_ffmpeg_args_with_audio(
         args.extend(["-i".into(), item.external_audio.clone()]);
     }
 
+    media_edit::append_trim(&mut args, item);
     args.extend([
         "-map".into(),
         "0:v:0".into(),
@@ -3445,9 +3515,12 @@ fn build_ffmpeg_args_with_audio(
         "-af".into(),
         "apad".into(),
         "-t".into(),
-        format!("{:.6}", item.duration.max(0.001)),
+        format!("{:.6}", media_edit::duration(item).max(0.001)),
     ]);
-    let panorama = preset.keep_panorama && item.is_panorama;
+    let panorama = media_edit::preserve_panorama(item, preset);
+    if media_edit::has_geometry(item) && item.is_panorama {
+        args.extend(["-map_metadata:s:v:0".into(), "-1".into(), "-metadata:s:v:0".into(), "projection=".into(), "-metadata:s:v:0".into(), "stereo_mode=".into()]);
+    }
     if panorama {
         args.extend([
             "-metadata:s:v:0".into(),
@@ -3492,7 +3565,13 @@ fn build_alpha_ffmpeg_args_with_sequence(
     } else {
         args.extend(["-i".into(), item.source.clone()]);
     }
-    let mut filters = vec!["alphaextract".into()];
+    media_edit::append_trim(&mut args, item);
+    let mut filters = vec!["format=rgba".into(), "alphaextract".into()];
+    if item.media_kind == "sequence" {
+        filters.push(format!("setpts=N/({:.6}*TB)", item.sequence_fps.max(0.001)));
+        filters.push(format!("scale={}:{},setsar={:.6}", item.width.max(2), item.height.max(2), item.sequence_pixel_aspect.max(0.001)));
+    }
+    media_edit::append_geometry(&mut filters, item);
     match preset.resolution_mode.as_str() {
         "short_edge" => {
             let edge = preset.short_edge.max(120);
@@ -3568,6 +3647,8 @@ fn video_filter(item: &QueueItem, preset: &Preset) -> Option<String> {
 }
 
 fn video_filter_with_exe_dir(item: &QueueItem, preset: &Preset, exe_dir: &Path) -> Option<String> {
+    let effective = media_edit::effective_preset(item, preset);
+    let preset = &effective;
     let mut filters = Vec::new();
     if matches!(item.source_color_override.as_str(), "sdr" | "hlg" | "hdr10") {
         let color = source_color(item);
@@ -3585,6 +3666,7 @@ fn video_filter_with_exe_dir(item: &QueueItem, preset: &Preset, exe_dir: &Path) 
             item.sequence_pixel_aspect.max(0.001)
         ));
     }
+    media_edit::append_geometry(&mut filters, item);
     match preset.resolution_mode.as_str() {
         "short_edge" => {
             let edge = preset.short_edge.max(120);

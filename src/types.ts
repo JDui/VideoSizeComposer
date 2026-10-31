@@ -2,7 +2,7 @@ export type Codec = "h265" | "h264" | "av1" | "prores";
 export type Hardware = "auto" | "cuda" | "metal" | "cpu";
 export type OutputMode = "single_folder" | "in_place" | "subfolder";
 export type NamingMode = "original" | "suffix_prefix";
-export type OutputContainer = "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav";
+export type OutputContainer = "source" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "m4a" | "wav" | "mp3";
 export type ResolutionMode = "source" | "short_edge" | "scale_percent" | "custom";
 export type FpsMode = "source" | "preset" | "custom";
 export type HdrMode = "source" | "sdr" | "hlg" | "hdr10" | "dolby_vision";
@@ -27,6 +27,12 @@ export interface ToolStatus {
   encoders: string[];
   ok: boolean;
   insta360Sdk?: string;
+}
+
+export interface Insta360SdkStatus {
+  state: "ready" | "missing" | "unsupported" | "authorization_required";
+  path: string | null;
+  message: string;
 }
 
 export interface PanoramaPreferences {
@@ -72,6 +78,22 @@ export interface Preset {
   lutName: string;
   lutIntensity: number;
   cpuFallback: boolean;
+}
+
+/** Per-item draft edits, committed only when the media editor is applied. */
+export interface MediaEdits {
+  trimStart: number;
+  /** Zero keeps the source ending. */
+  trimEnd: number;
+  crop: { x: number; y: number; width: number; height: number } | null;
+  /** Zero for both dimensions follows the output preset. */
+  canvasWidth: number;
+  canvasHeight: number;
+  fit: "contain" | "cover";
+  /** Null inherits the output preset LUT. */
+  lutEnabled: boolean | null;
+  lutName: string;
+  lutIntensity: number;
 }
 
 export interface QueueItem {
@@ -131,6 +153,7 @@ export interface QueueItem {
   externalAudio: string;
   /** Visual generated for audio-only media when producing video. */
   audioVisual: "timecode" | "black" | "white";
+  edits?: MediaEdits;
 }
 
 export interface EncodeJob {

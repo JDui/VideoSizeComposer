@@ -225,6 +225,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .selection-marquee { position: absolute; z-index: 4; pointer-events: none; border: 1px solid var(--accent); border-radius: 3px; background: color-mix(in srgb, var(--accent) 16%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--bg) 25%, transparent); }
 .media-row { min-height: clamp(68px, 7.91vh, 82px); padding: 8px 10px; border-bottom: 1px solid var(--line-soft); transition: background .16s ease; }
 .media-row:hover { background: var(--surface); }
+.media-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.output-spec .item-edit-summary { color: var(--accent); }
 .media-row.is-selected { background: color-mix(in srgb, var(--accent) 3%, transparent); }
 .row-check { display: flex; align-items: center; justify-content: flex-start; gap: 5px; cursor: pointer; }
 .row-check input { position: absolute; opacity: 0; pointer-events: none; }
@@ -419,6 +421,23 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .modal-grid.three-columns { grid-template-columns: repeat(3, minmax(0,1fr)); }
 .modal-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
 .modal-section h3 { margin: 0 0 12px; font-size: 12px; }
+.sdk-settings { display: grid; gap: 9px; }
+.sdk-settings h3 { margin-bottom: 0; }
+.sdk-state { display: flex; align-items: flex-start; gap: 7px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.sdk-state > svg { flex: 0 0 auto; margin-top: 1px; color: var(--amber); }
+.sdk-state.ready > svg { color: var(--success); }
+.sdk-state .spin { color: var(--accent); }
+.sdk-path-row, .sdk-url-row, .sdk-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sdk-path-row input, .sdk-url-row input { flex: 1; min-width: 0; }
+.sdk-path-row .secondary-button { flex: 0 0 auto; min-height: 30px; padding: 0 8px; }
+.sdk-settings .sdk-path-row input, .sdk-url-row input { height: 30px; }
+.sdk-actions .secondary-button, .sdk-url-row .secondary-button { min-height: 30px; font-size: 11px; }
+.sdk-actions > button:first-child { flex: 1; }
+.sdk-url-row input { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); padding: 0 8px; font-size: 11px; }
+.sdk-direct > summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+.sdk-direct[open] > summary { margin-bottom: 8px; }
+.sdk-direct .field-note { display: block; margin-top: 6px; }
+.sdk-error { padding: 8px; border: 1px solid color-mix(in srgb, var(--amber) 35%, var(--line)); border-radius: 6px; color: var(--amber); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .preset-editor-intro { min-height: 54px; margin-bottom: 14px; padding: 0 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); display: flex; align-items: center; gap: 10px; }
 .preset-editor-intro > svg { color: var(--accent); }
 .preset-editor-intro > span { display: grid; gap: 4px; }

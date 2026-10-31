@@ -1,6 +1,6 @@
 [package]
 name = "videosize-composer"
-version = "2026.9.1"
+version = "2026.12.5"
 description = "Cross-platform video compression tool"
 authors = ["VideoSize Composer"]
 edition = "2021"
@@ -26,6 +26,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+url = "2"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
